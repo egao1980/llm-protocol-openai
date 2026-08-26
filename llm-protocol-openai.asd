@@ -8,8 +8,7 @@
   (:cl-repo
    (:ci (:with ("llm-protocol/capability"
                 "http-backend-async"
-                "event-backend-libuv")
-         :sources (("rove" :ql)))))
+                "event-backend-libuv"))))
   :serial t
   :pathname "src"
   :components ((:file "package")
