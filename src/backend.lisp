@@ -105,10 +105,19 @@
   (let ((obj (ignore-errors (stack-json:decode body))))
     (cond
       ((<= 200 status 299) (or obj (error 'llm-error :message "empty JSON body")))
-      (t (error 'llm-http-error
-                :status status
-                :body body
-                :message (%error-message obj (format nil "HTTP ~a" status)))))))
+      (t
+       (restart-case
+           (error 'llm-http-error
+                  :status status
+                  :body body
+                  :retryable-p (http-status-retryable-p status)
+                  :message (%error-message obj (format nil "HTTP ~a" status)))
+         (retry ()
+           :report "Retry the HTTP request"
+           (llm-protocol::%invoke-retry))
+         (use-value (value)
+           :report "Use a supplied decoded object"
+           value))))))
 
 (defun %str (x)
   (cond
