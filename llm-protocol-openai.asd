@@ -6,7 +6,7 @@
   :depends-on ("llm-protocol" "http-protocol" "json-protocol" "json-backend-jzon" "babel")
   :properties
   (:cl-repo
-   (:ci (:with ("llm-protocol/capability"
+   (:ci (:with ("capability-protocol"
                 "http-backend-async"
                 "event-backend-libuv"))))
   :serial t

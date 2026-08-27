@@ -140,6 +140,29 @@
                 "hi")
                'llm-protocol:llm-http-error)))
 
+(defun %fake-openai-429 (method url &key headers content)
+  (declare (ignore method url headers content))
+  (values 429 (stack-json:encode
+               (%ht "error" (%ht "message" "rate limited" "type" "rate")))))
+
+(deftest openai-http-retryable-slot
+  (handler-case
+      (llm-protocol:generate
+       (llm-protocol-openai:make-openai-compat-backend
+        :request-fn #'%fake-openai-429)
+       "hi")
+    (llm-protocol:llm-http-error (c)
+      (ok (eql 429 (llm-protocol:llm-http-error-status c)))
+      (ok (llm-protocol:llm-http-error-retryable-p c))))
+  (handler-case
+      (llm-protocol:generate
+       (llm-protocol-openai:make-openai-compat-backend
+        :request-fn #'%fake-openai-error)
+       "hi")
+    (llm-protocol:llm-http-error (c)
+      (ok (eql 401 (llm-protocol:llm-http-error-status c)))
+      (ng (llm-protocol:llm-http-error-retryable-p c)))))
+
 (deftest openai-stream-unsupported
   (ok (signals (llm-protocol:stream-generate
                 (llm-protocol-openai:make-openai-compat-backend :request-fn #'%fake-openai)
