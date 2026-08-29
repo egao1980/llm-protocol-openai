@@ -519,6 +519,59 @@
       (ok (= 16 (gethash "max_output_tokens" seen)))
       (ok (equal "hi" (gethash "input" seen))))))
 
+(deftest openai-respond-settings-extra-on-wire
+  (let ((seen nil))
+    (flet ((capture (method url &key headers content &allow-other-keys)
+             (declare (ignore method headers))
+             (ok (search "/responses" url))
+             (setf seen (stack-json:decode content))
+             (%fake-openai :post url :content content)))
+      (llm-protocol:respond
+       (llm-protocol-openai:make-openai-compat-backend :request-fn #'capture)
+       "hi"
+       :settings '(:temperature 0
+                   :extra (:previous-response-id "resp_prev"
+                           :instructions "be brief"
+                           :reasoning (:effort :medium :summary :auto)
+                           :store nil
+                           :conversation (:id "conv_1"))))
+      (ok (equal "resp_prev" (gethash "previous_response_id" seen)))
+      (ok (equal "be brief" (gethash "instructions" seen)))
+      (ok (equal "medium" (gethash "effort" (gethash "reasoning" seen))))
+      (ok (equal "auto" (gethash "summary" (gethash "reasoning" seen))))
+      (ok (nth-value 1 (gethash "store" seen)))
+      (ok (null (gethash "store" seen)))
+      (ok (equal "conv_1" (gethash "id" (gethash "conversation" seen))))
+      (ok (zerop (gethash "temperature" seen))))))
+
+(deftest openai-settings-extra-first-class-wins
+  (let ((seen nil))
+    (flet ((capture (method url &key headers content &allow-other-keys)
+             (declare (ignore method url headers))
+             (setf seen (stack-json:decode content))
+             (%fake-openai :post "http://x/chat/completions" :content content)))
+      (llm-protocol:generate
+       (llm-protocol-openai:make-openai-compat-backend :request-fn #'capture)
+       "hi"
+       :settings '(:temperature 0 :extra (:temperature 1 :seed 7)))
+      (ok (zerop (gethash "temperature" seen)))
+      (ok (= 7 (gethash "seed" seen))))))
+
+(deftest openai-stream-respond-settings-extra
+  (let ((seen nil))
+    (flet ((capture (method url &key headers content &allow-other-keys)
+             (declare (ignore method headers))
+             (ok (search "/responses" url))
+             (setf seen (stack-json:decode content))
+             (%fake-openai :post url :content content)))
+      (llm-protocol:stream-respond
+       (llm-protocol-openai:make-openai-compat-backend :request-fn #'capture)
+       "hi"
+       :settings '(:extra (:previous-response-id "resp_prev" :instructions "x")))
+      (ok (eq t (gethash "stream" seen)))
+      (ok (equal "resp_prev" (gethash "previous_response_id" seen)))
+      (ok (equal "x" (gethash "instructions" seen))))))
+
 (deftest openai-respond-tools
   (let* ((backend (llm-protocol-openai:make-openai-compat-backend
                    :request-fn #'%fake-openai))

@@ -25,6 +25,16 @@ Transport is `http-protocol` — bind [`http-backend-async`](https://github.com/
 
 `OPENAI_API_KEY` / `LM_API_TOKEN` / `OPENAI_BASE_URL` / `OPENAI_MODEL` fill omitted initargs. Default base is LM Studio `http://127.0.0.1:1234/v1`.
 
+`llm-settings-extra` (plist or hash) is merged onto the JSON body after first-class fields. Kebab keywords → snake keys; keyword values → lowercase strings; nested plists → objects; `nil` → JSON false. First-class keys already on the body win. Responses escape hatch:
+
+```lisp
+(stack-llm:respond b "ping"
+  :settings '(:extra (:previous-response-id "resp_123"
+                      :instructions "be brief"
+                      :reasoning (:effort :medium)
+                      :store nil)))
+```
+
 `stream-generate` → `POST /chat/completions` with `stream: true` (chat.completion.chunk SSE, `[DONE]`). `stream-respond` → `POST /responses` with `stream: true` (typed events: `response.output_text.delta`, `response.reasoning_text.delta` / `response.reasoning_summary_text.delta`, `response.function_call_arguments.*`, `response.completed` / `response.failed`). Compat servers that stream `/responses` as chat chunks are accepted. `:on-part` gets text/thinking deltas; assembled `llm-response` is returned at EOF.
 
 Tests: mock `request-fn` + a usocket fixture through async×libuv. Live LM Studio: `LLM_OPENAI_LIVE=1`. CI needs published `llm-protocol` on GHCR.
