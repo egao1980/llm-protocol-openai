@@ -1,9 +1,10 @@
 (defsystem "llm-protocol-openai"
-  :version "0.1.0"
+  :version "0.2.0"
   :description "OpenAI chat/completions + Responses backend for llm-protocol"
   :author "egao1980"
   :license "MIT"
-  :depends-on ("llm-protocol" "http-protocol" "json-protocol" "json-backend-jzon" "babel")
+  :depends-on ("llm-protocol" "http-protocol" "json-protocol" "json-backend-jzon"
+               "sse-protocol" "babel")
   :properties
   (:cl-repo
    (:ci (:with ("capability-protocol"
@@ -12,7 +13,8 @@
   :serial t
   :pathname "src"
   :components ((:file "package")
-               (:file "backend"))
+               (:file "backend")
+               (:file "stream"))
   :in-order-to ((test-op (test-op "llm-protocol-openai/tests"))))
 
 (defsystem "llm-protocol-openai/tests"

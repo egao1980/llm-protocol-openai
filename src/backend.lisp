@@ -45,6 +45,9 @@
 (defmethod backend-supports-p ((backend openai-compat-backend) (feature (eql :responses)))
   t)
 
+(defmethod backend-supports-p ((backend openai-compat-backend) (feature (eql :stream)))
+  t)
+
 (defun %ht (&rest kvs)
   (let ((h (make-hash-table :test 'equal)))
     (loop for (k v) on kvs by #'cddr
@@ -55,9 +58,9 @@
 (defun %join (base path)
   (format nil "~a~a" (string-right-trim "/" (or base "")) path))
 
-(defun %headers (backend)
+(defun %headers (backend &key (accept "application/json"))
   (let ((h `(("content-type" . "application/json")
-             ("accept" . "application/json"))))
+             ("accept" . ,accept))))
     (when (and (openai-api-key backend) (plusp (length (openai-api-key backend))))
       (push (cons "authorization"
                   (format nil "Bearer ~a" (openai-api-key backend)))
@@ -74,22 +77,32 @@
        (babel:octets-to-string b :encoding :utf-8))
       (t ""))))
 
-(defun %http-request (method url &key headers content)
+(defun %http-request (method url &key headers content want-stream)
   (unless http-protocol:*http-backend*
     (error 'llm-error
            :message "*http-backend* is nil — bind an http-protocol backend"))
   (let ((res (apply #'http:request method url
                     :headers headers
                     :timeout 180
+                    :want-stream (and want-stream t)
                     (and content (list :content content)))))
-    (values (http-protocol:response-status res) (%body-string res))))
+    (values (http-protocol:response-status res)
+            (if want-stream
+                (http-protocol:response-body res)
+                (%body-string res)))))
 
-(defun %request (backend method path &optional object)
+(defun %request (backend method path &optional object &key want-stream accept)
   (let* ((fn (or (openai-request-fn backend) #'%http-request))
          (url (%join (openai-base-url backend) path))
-         (content (and object (stack-json:encode object))))
+         (content (and object (stack-json:encode object)))
+         (headers (%headers backend
+                            :accept (or accept
+                                        (if want-stream
+                                            "text/event-stream"
+                                            "application/json")))))
     (multiple-value-bind (status body)
-        (funcall fn method url :headers (%headers backend) :content content)
+        (funcall fn method url :headers headers :content content
+                 :want-stream want-stream)
       (values status body))))
 
 (defun %error-message (obj fallback)
@@ -373,21 +386,48 @@
                      "strict" t
                      "schema" (structured-output-json-schema out)))))))
 
+(defun %chat-completion-body (backend turns &key model settings tools tool-choice
+                              stream)
+  (let* ((settings (coerce-settings settings))
+         (model (or model (openai-default-model backend))))
+    (values model
+            (%ht "model" model
+                 "messages" (map 'vector #'%wire-turn (coerce-turns turns))
+                 "temperature" (and settings (llm-settings-temperature settings))
+                 "max_tokens" (and settings (llm-settings-max-tokens settings))
+                 "stop" (and settings (llm-settings-stop settings))
+                 "top_p" (and settings (llm-settings-top-p settings))
+                 "response_format" (%wire-chat-response-format settings)
+                 "tools" (and tools (map 'vector #'%wire-tool
+                                         (llm-protocol::%as-list tools)))
+                 "tool_choice" (%wire-tool-choice tool-choice)
+                 "stream" (if stream t :omit)
+                 "stream_options" (if stream (%ht "include_usage" t) :omit)))))
+
+(defun %responses-body (backend items &key model settings tools tool-choice stream)
+  (let* ((settings (coerce-settings settings))
+         (model (or model (openai-default-model backend)))
+         (normalized (coerce-items items))
+         (input (or (%scalar-user-input normalized)
+                    (map 'vector #'%wire-item normalized))))
+    (values model
+            (%ht "model" model
+                 "input" input
+                 "temperature" (and settings (llm-settings-temperature settings))
+                 "max_output_tokens" (and settings (llm-settings-max-tokens settings))
+                 "top_p" (and settings (llm-settings-top-p settings))
+                 "text" (%wire-responses-text settings)
+                 "tools" (and tools (map 'vector #'%wire-responses-tool
+                                         (llm-protocol::%as-list tools)))
+                 "tool_choice" (%wire-tool-choice tool-choice)
+                 "stream" (if stream t :omit)))))
+
 (defmethod generate ((backend openai-compat-backend) turns &key model settings
                      tools tool-choice output)
   (declare (ignore output))
-  (let* ((settings (coerce-settings settings))
-         (model (or model (openai-default-model backend)))
-         (body (%ht "model" model
-                    "messages" (map 'vector #'%wire-turn (coerce-turns turns))
-                    "temperature" (and settings (llm-settings-temperature settings))
-                    "max_tokens" (and settings (llm-settings-max-tokens settings))
-                    "stop" (and settings (llm-settings-stop settings))
-                    "top_p" (and settings (llm-settings-top-p settings))
-                    "response_format" (%wire-chat-response-format settings)
-                    "tools" (and tools (map 'vector #'%wire-tool
-                                            (llm-protocol::%as-list tools)))
-                    "tool_choice" (%wire-tool-choice tool-choice))))
+  (multiple-value-bind (model body)
+      (%chat-completion-body backend turns :model model :settings settings
+                             :tools tools :tool-choice tool-choice)
     (multiple-value-bind (status text)
         (%request backend :post "/chat/completions" body)
       (%parse-response (%decode status text) model))))
@@ -395,33 +435,12 @@
 (defmethod respond ((backend openai-compat-backend) items &key model settings
                     tools tool-choice output)
   (declare (ignore output))
-  (let* ((settings (coerce-settings settings))
-         (model (or model (openai-default-model backend)))
-         (normalized (coerce-items items))
-         (input (or (%scalar-user-input normalized)
-                    (map 'vector #'%wire-item normalized)))
-         (body (%ht "model" model
-                    "input" input
-                    "temperature" (and settings (llm-settings-temperature settings))
-                    "max_output_tokens" (and settings (llm-settings-max-tokens settings))
-                    "top_p" (and settings (llm-settings-top-p settings))
-                    "text" (%wire-responses-text settings)
-                    "tools" (and tools (map 'vector #'%wire-responses-tool
-                                            (llm-protocol::%as-list tools)))
-                    "tool_choice" (%wire-tool-choice tool-choice))))
+  (multiple-value-bind (model body)
+      (%responses-body backend items :model model :settings settings
+                       :tools tools :tool-choice tool-choice)
     (multiple-value-bind (status text)
         (%request backend :post "/responses" body)
       (%parse-responses (%decode status text) model))))
-
-(defmethod stream-generate ((backend openai-compat-backend) turns &key model
-                            settings tools tool-choice on-part output)
-  (declare (ignore turns model settings tools tool-choice on-part output))
-  (error 'llm-unsupported :message "openai-compat wave-1 does not stream"))
-
-(defmethod stream-respond ((backend openai-compat-backend) items &key model
-                           settings tools tool-choice on-part output)
-  (declare (ignore items model settings tools tool-choice on-part output))
-  (error 'llm-unsupported :message "openai-compat wave-1 does not stream"))
 
 (defmethod list-models ((backend openai-compat-backend) &key)
   (multiple-value-bind (status text)

@@ -7,71 +7,247 @@
             do (setf (gethash k h) v))
     h))
 
-(defun %fake-openai (method url &key headers content)
-  (declare (ignore headers))
+(defun %sse-block (data &optional event)
+  (with-output-to-string (s)
+    (when event
+      (format s "event: ~a~%" event))
+    (format s "data: ~a~%~%" data)))
+
+(defun %last-user-text (body)
+  (let ((msgs (gethash "messages" body)))
+    (when (and msgs (plusp (length msgs)))
+      (gethash "content" (elt msgs (1- (length msgs)))))))
+
+(defun %responses-input-text (body)
+  (let ((input (gethash "input" body)))
+    (cond
+      ((stringp input) input)
+      ((and input (plusp (length input)))
+       (let ((last (elt input (1- (length input)))))
+         (or (gethash "text" last)
+             (let ((c (gethash "content" last)))
+               (if (and c (plusp (length c)))
+                   (gethash "text" (elt c 0))
+                   "")))))
+      (t ""))))
+
+(defun %chat-sse (text &key model tools)
+  (with-output-to-string (s)
+    (if tools
+        (progn
+          (write-string
+           (%sse-block
+            (stack-json:encode
+             (%ht "model" model
+                  "choices"
+                  (vector (%ht "finish_reason" :null
+                               "delta"
+                               (%ht "tool_calls"
+                                    (vector (%ht "index" 0
+                                                 "id" "call_1"
+                                                 "type" "function"
+                                                 "function"
+                                                 (%ht "name" "sum"
+                                                      "arguments" "")))))))))
+           s)
+          (write-string
+           (%sse-block
+            (stack-json:encode
+             (%ht "model" model
+                  "choices"
+                  (vector (%ht "finish_reason" :null
+                               "delta"
+                               (%ht "tool_calls"
+                                    (vector (%ht "index" 0
+                                                 "function"
+                                                 (%ht "arguments" "{\"a\":1}")))))))))
+           s)
+          (write-string
+           (%sse-block
+            (stack-json:encode
+             (%ht "model" model
+                  "usage" (%ht "prompt_tokens" 3 "completion_tokens" 2
+                               "total_tokens" 5)
+                  "choices"
+                  (vector (%ht "finish_reason" "tool_calls"
+                               "delta" (%ht))))))
+           s))
+        (let* ((full (format nil "ok:~a" text))
+               (cut (min 3 (length full))))
+          (write-string
+           (%sse-block
+            (stack-json:encode
+             (%ht "model" model
+                  "choices"
+                  (vector (%ht "finish_reason" :null
+                               "delta" (%ht "content" (subseq full 0 cut)))))))
+           s)
+          (when (< cut (length full))
+            (write-string
+             (%sse-block
+              (stack-json:encode
+               (%ht "model" model
+                    "choices"
+                    (vector (%ht "finish_reason" :null
+                                 "delta" (%ht "content" (subseq full cut)))))))
+             s))
+          (write-string
+           (%sse-block
+            (stack-json:encode
+             (%ht "model" model
+                  "usage" (%ht "prompt_tokens" 3 "completion_tokens" 2
+                               "total_tokens" 5)
+                  "choices"
+                  (vector (%ht "finish_reason" "stop" "delta" (%ht))))))
+           s)))
+    (write-string (%sse-block "[DONE]") s)))
+
+(defun %responses-sse (text &key model tools)
+  (with-output-to-string (s)
+    (if tools
+        (progn
+          (write-string
+           (%sse-block
+            (stack-json:encode
+             (%ht "type" "response.output_item.added"
+                  "output_index" 0
+                  "item" (%ht "type" "function_call"
+                              "call_id" "call_1"
+                              "name" "sum"
+                              "arguments" "")))
+            "response.output_item.added")
+           s)
+          (write-string
+           (%sse-block
+            (stack-json:encode
+             (%ht "type" "response.function_call_arguments.delta"
+                  "output_index" 0
+                  "delta" "{\"a\":1}"))
+            "response.function_call_arguments.delta")
+           s)
+          (write-string
+           (%sse-block
+            (stack-json:encode
+             (%ht "type" "response.function_call_arguments.done"
+                  "output_index" 0
+                  "name" "sum"
+                  "arguments" "{\"a\":1}"))
+            "response.function_call_arguments.done")
+           s)
+          (write-string
+           (%sse-block
+            (stack-json:encode
+             (%ht "type" "response.completed"
+                  "response"
+                  (%ht "id" "resp_1"
+                       "status" "completed"
+                       "model" model
+                       "usage" (%ht "input_tokens" 3 "output_tokens" 2
+                                    "total_tokens" 5)
+                       "output"
+                       (vector (%ht "type" "function_call"
+                                    "call_id" "call_1"
+                                    "name" "sum"
+                                    "arguments" "{\"a\":1}")))))
+            "response.completed")
+           s))
+        (let* ((full (format nil "ok:~a" text))
+               (cut (min 3 (length full))))
+          (write-string
+           (%sse-block
+            (stack-json:encode
+             (%ht "type" "response.output_text.delta"
+                  "delta" (subseq full 0 cut)))
+            "response.output_text.delta")
+           s)
+          (when (< cut (length full))
+            (write-string
+             (%sse-block
+              (stack-json:encode
+               (%ht "type" "response.output_text.delta"
+                    "delta" (subseq full cut)))
+              "response.output_text.delta")
+             s))
+          (write-string
+           (%sse-block
+            (stack-json:encode
+             (%ht "type" "response.completed"
+                  "response"
+                  (%ht "id" "resp_1"
+                       "status" "completed"
+                       "model" model
+                       "usage" (%ht "input_tokens" 3 "output_tokens" 2
+                                    "total_tokens" 5)
+                       "output"
+                       (vector (%ht "type" "message"
+                                    "role" "assistant"
+                                    "content"
+                                    (vector (%ht "type" "output_text"
+                                                 "text" full)))))))
+            "response.completed")
+           s)))))
+
+(defun %fake-openai (method url &key headers content want-stream)
+  (declare (ignore headers want-stream))
   (cond
     ((and (eq method :post) (search "/chat/completions" url))
      (let* ((body (stack-json:decode content))
-            (msgs (gethash "messages" body))
-            (last (elt msgs (1- (length msgs))))
-            (tools (gethash "tools" body)))
-       (values 200
-               (stack-json:encode
-                (%ht "model" (or (gethash "model" body) "gpt-4o-mini")
-                     "usage" (%ht "prompt_tokens" 3 "completion_tokens" 2
-                                  "total_tokens" 5)
-                     "choices"
-                     (vector (%ht "finish_reason" (if tools "tool_calls" "stop")
-                                  "message"
-                                  (%ht "role" "assistant"
-                                       "content" (if tools
-                                                     :null
-                                                     (format nil "ok:~a"
-                                                             (gethash "content" last)))
-                                       "tool_calls"
-                                       (when tools
-                                         (vector (%ht "id" "call_1"
-                                                      "type" "function"
-                                                      "function"
-                                                      (%ht "name" "sum"
-                                                           "arguments" "{\"a\":1}"))))))))))))
+            (text (%last-user-text body))
+            (tools (gethash "tools" body))
+            (model (or (gethash "model" body) "gpt-4o-mini")))
+       (if (gethash "stream" body)
+           (values 200 (%chat-sse text :model model :tools tools))
+           (values 200
+                   (stack-json:encode
+                    (%ht "model" model
+                         "usage" (%ht "prompt_tokens" 3 "completion_tokens" 2
+                                      "total_tokens" 5)
+                         "choices"
+                         (vector (%ht "finish_reason" (if tools "tool_calls" "stop")
+                                      "message"
+                                      (%ht "role" "assistant"
+                                           "content" (if tools
+                                                         :null
+                                                         (format nil "ok:~a" text))
+                                           "tool_calls"
+                                           (when tools
+                                             (vector (%ht "id" "call_1"
+                                                          "type" "function"
+                                                          "function"
+                                                          (%ht "name" "sum"
+                                                               "arguments" "{\"a\":1}")))))))))))))
     ((and (eq method :post) (search "/responses" url))
      (let* ((body (stack-json:decode content))
-            (input (gethash "input" body))
+            (text (%responses-input-text body))
             (tools (gethash "tools" body))
-            (text (if (stringp input)
-                      input
-                      (let ((last (elt input (1- (length input)))))
-                        (or (gethash "text" last)
-                            (let ((c (gethash "content" last)))
-                              (if (and c (plusp (length c)))
-                                  (gethash "text" (elt c 0))
-                                  "")))))))
-       (values 200
-               (stack-json:encode
-                (%ht "id" "resp_1"
-                     "status" "completed"
-                     "model" (or (gethash "model" body) "gpt-4o-mini")
-                     "usage" (%ht "input_tokens" 3 "output_tokens" 2
-                                  "total_tokens" 5)
-                     "output"
-                     (if tools
-                         (vector (%ht "type" "function_call"
-                                      "call_id" "call_1"
-                                      "name" "sum"
-                                      "arguments" "{\"a\":1}"))
-                         (vector (%ht "type" "message"
-                                      "role" "assistant"
-                                      "content"
-                                      (vector (%ht "type" "output_text"
-                                                   "text" (format nil "ok:~a" text)))))))))))
+            (model (or (gethash "model" body) "gpt-4o-mini")))
+       (if (gethash "stream" body)
+           (values 200 (%responses-sse text :model model :tools tools))
+           (values 200
+                   (stack-json:encode
+                    (%ht "id" "resp_1"
+                         "status" "completed"
+                         "model" model
+                         "usage" (%ht "input_tokens" 3 "output_tokens" 2
+                                      "total_tokens" 5)
+                         "output"
+                         (if tools
+                             (vector (%ht "type" "function_call"
+                                          "call_id" "call_1"
+                                          "name" "sum"
+                                          "arguments" "{\"a\":1}"))
+                             (vector (%ht "type" "message"
+                                          "role" "assistant"
+                                          "content"
+                                          (vector (%ht "type" "output_text"
+                                                       "text" (format nil "ok:~a" text))))))))))))
     ((search "/models" url)
      (values 200 (stack-json:encode
                   (%ht "data" (vector (%ht "id" "local" "owned_by" "lmstudio"))))))
     (t (values 404 "{}"))))
 
-(defun %fake-openai-error (method url &key headers content)
-  (declare (ignore method url headers content))
+(defun %fake-openai-error (method url &key headers content want-stream)
+  (declare (ignore method url headers content want-stream))
   (values 401 (stack-json:encode
                (%ht "error" (%ht "message" "invalid api key" "type" "auth")))))
 
@@ -88,7 +264,7 @@
 
 (deftest openai-settings-on-wire
   (let ((seen nil))
-    (flet ((capture (method url &key headers content)
+    (flet ((capture (method url &key headers content &allow-other-keys)
              (declare (ignore method url headers))
              (setf seen (stack-json:decode content))
              (%fake-openai :post "http://x/chat/completions" :content content)))
@@ -104,7 +280,7 @@
         (schema (let ((h (make-hash-table :test 'equal)))
                   (setf (gethash "type" h) "object")
                   h)))
-    (flet ((capture (method url &key headers content)
+    (flet ((capture (method url &key headers content &allow-other-keys)
              (declare (ignore method url headers))
              (setf seen (stack-json:decode content))
              (%fake-openai :post "http://x/chat/completions" :content content)))
@@ -140,8 +316,8 @@
                 "hi")
                'llm-protocol:llm-http-error)))
 
-(defun %fake-openai-429 (method url &key headers content)
-  (declare (ignore method url headers content))
+(defun %fake-openai-429 (method url &key headers content want-stream)
+  (declare (ignore method url headers content want-stream))
   (values 429 (stack-json:encode
                (%ht "error" (%ht "message" "rate limited" "type" "rate")))))
 
@@ -163,11 +339,161 @@
       (ok (eql 401 (llm-protocol:llm-http-error-status c)))
       (ng (llm-protocol:llm-http-error-retryable-p c)))))
 
-(deftest openai-stream-unsupported
-  (ok (signals (llm-protocol:stream-generate
-                (llm-protocol-openai:make-openai-compat-backend :request-fn #'%fake-openai)
-                "hi")
-               'llm-protocol:llm-unsupported)))
+(deftest openai-stream-generate-mock
+  (let* ((seen nil)
+         (backend (llm-protocol-openai:make-openai-compat-backend
+                   :request-fn #'%fake-openai))
+         (r (llm-protocol:stream-generate
+             backend "hi" :model "local"
+             :on-part (lambda (p) (push p seen)))))
+    (ok (equal "ok:hi" (llm-protocol:llm-response-text r)))
+    (ok (equal "local" (llm-protocol:llm-response-model r)))
+    (ok (eq :stop (llm-protocol:llm-response-finish-reason r)))
+    (ok (= 5 (llm-protocol:llm-usage-total-tokens (llm-protocol:llm-response-usage r))))
+    (ok (>= (length (remove-if-not #'llm-protocol:llm-text-part-p seen)) 2))))
+
+(deftest openai-stream-generate-tools
+  (let* ((backend (llm-protocol-openai:make-openai-compat-backend
+                   :request-fn #'%fake-openai))
+         (r (llm-protocol:stream-generate
+             backend "add"
+             :tools (list (llm-protocol:make-llm-tool :name "sum")))))
+    (ok (eq :tool-use (llm-protocol:llm-response-finish-reason r)))
+    (ok (equal "sum" (llm-protocol:llm-tool-call-part-name
+                      (first (llm-protocol:llm-response-tool-calls r)))))
+    (ok (equal "{\"a\":1}" (llm-protocol:llm-tool-call-part-arguments
+                            (first (llm-protocol:llm-response-tool-calls r)))))))
+
+(deftest openai-stream-generate-wire
+  (let ((seen nil))
+    (flet ((capture (method url &key headers content &allow-other-keys)
+             (declare (ignore method headers))
+             (ok (search "/chat/completions" url))
+             (setf seen (stack-json:decode content))
+             (%fake-openai :post url :content content)))
+      (llm-protocol:stream-generate
+       (llm-protocol-openai:make-openai-compat-backend :request-fn #'capture)
+       "hi")
+      (ok (eq t (gethash "stream" seen)))
+      (ok (eq t (gethash "include_usage" (gethash "stream_options" seen)))))))
+
+(deftest openai-stream-respond-mock
+  (let* ((seen nil)
+         (backend (llm-protocol-openai:make-openai-compat-backend
+                   :request-fn #'%fake-openai))
+         (r (llm-protocol:stream-respond
+             backend "hi" :model "local"
+             :on-part (lambda (p) (push p seen)))))
+    (ok (equal "ok:hi" (llm-protocol:llm-response-text r)))
+    (ok (equal "resp_1" (llm-protocol:llm-response-id r)))
+    (ok (llm-protocol:llm-message-item-p (first (llm-protocol:llm-response-items r))))
+    (ok (eq :stop (llm-protocol:llm-response-finish-reason r)))
+    (ok (>= (length (remove-if-not #'llm-protocol:llm-text-part-p seen)) 2))))
+
+(deftest openai-stream-respond-tools
+  (let* ((seen nil)
+         (backend (llm-protocol-openai:make-openai-compat-backend
+                   :request-fn #'%fake-openai))
+         (r (llm-protocol:stream-respond
+             backend "add"
+             :tools (list (llm-protocol:make-llm-tool :name "sum"))
+             :on-part (lambda (p) (push p seen)))))
+    (ok (eq :tool-use (llm-protocol:llm-response-finish-reason r)))
+    (ok (llm-protocol:llm-function-call-item-p
+         (first (llm-protocol:llm-response-items r))))
+    (ok (equal "sum" (llm-protocol:llm-tool-call-part-name
+                      (first (llm-protocol:llm-response-tool-calls r)))))
+    (ok (find-if #'llm-protocol:llm-tool-call-part-p seen))))
+
+(deftest openai-stream-respond-wire
+  (let ((seen nil))
+    (flet ((capture (method url &key headers content &allow-other-keys)
+             (declare (ignore method headers))
+             (ok (search "/responses" url))
+             (setf seen (stack-json:decode content))
+             (%fake-openai :post url :content content)))
+      (llm-protocol:stream-respond
+       (llm-protocol-openai:make-openai-compat-backend :request-fn #'capture)
+       "hi"
+       :settings '(:temperature 0 :max-tokens 16))
+      (ok (eq t (gethash "stream" seen)))
+      (ok (zerop (gethash "temperature" seen)))
+      (ok (= 16 (gethash "max_output_tokens" seen)))
+      (ok (equal "hi" (gethash "input" seen))))))
+
+(deftest openai-stream-respond-reasoning
+  (flet ((reasoning (method url &key headers content &allow-other-keys)
+           (declare (ignore method url headers content))
+           (values 200
+                   (concatenate
+                    'string
+                    (%sse-block
+                     (stack-json:encode
+                      (%ht "type" "response.reasoning_summary_text.delta"
+                           "delta" "scratch"))
+                     "response.reasoning_summary_text.delta")
+                    (%sse-block
+                     (stack-json:encode
+                      (%ht "type" "response.output_text.delta" "delta" "ok"))
+                     "response.output_text.delta")
+                    (%sse-block
+                     (stack-json:encode
+                      (%ht "type" "response.completed"
+                           "response"
+                           (%ht "id" "resp_r"
+                                "status" "completed"
+                                "model" "local"
+                                "output"
+                                (vector
+                                 (%ht "type" "reasoning"
+                                      "summary"
+                                      (vector (%ht "type" "summary_text"
+                                                   "text" "scratch")))
+                                 (%ht "type" "message"
+                                      "role" "assistant"
+                                      "content"
+                                      (vector (%ht "type" "output_text"
+                                                   "text" "ok")))))))
+                     "response.completed")))))
+    (let* ((seen nil)
+           (r (llm-protocol:stream-respond
+               (llm-protocol-openai:make-openai-compat-backend :request-fn #'reasoning)
+               "hi"
+               :on-part (lambda (p) (push p seen)))))
+      (ok (equal "ok" (llm-protocol:llm-response-text r)))
+      (ok (equal "scratch" (llm-protocol:llm-response-thinking r)))
+      (ok (find-if #'llm-protocol:llm-thinking-part-p seen))
+      (ok (find-if #'llm-protocol:llm-reasoning-item-p
+                   (llm-protocol:llm-response-items r))))))
+
+(deftest openai-stream-respond-failed
+  (flet ((failing (method url &key headers content &allow-other-keys)
+           (declare (ignore method url headers content))
+           (values 200
+                   (%sse-block
+                    (stack-json:encode
+                     (%ht "type" "response.failed"
+                          "response"
+                          (%ht "id" "resp_x"
+                               "status" "failed"
+                               "error" (%ht "message" "boom"))))
+                    "response.failed"))))
+    (ok (signals (llm-protocol:stream-respond
+                  (llm-protocol-openai:make-openai-compat-backend :request-fn #'failing)
+                  "hi")
+                 'llm-protocol:llm-http-error))))
+
+(deftest openai-stream-respond-chat-chunk-compat
+  "LM Studio / proxies sometimes stream /responses as chat.completion.chunk."
+  (flet ((compat (method url &key headers content &allow-other-keys)
+           (declare (ignore method headers))
+           (ok (search "/responses" url))
+           (values 200 (%chat-sse "hi" :model "local"))))
+    (let ((r (llm-protocol:stream-respond
+              (llm-protocol-openai:make-openai-compat-backend :request-fn #'compat)
+              "hi" :model "local")))
+      (ok (equal "ok:hi" (llm-protocol:llm-response-text r)))
+      (ok (eq :stop (llm-protocol:llm-response-finish-reason r))))))
 
 (deftest openai-respond-mock-http
   (let* ((backend (llm-protocol-openai:make-openai-compat-backend
@@ -180,12 +506,12 @@
 
 (deftest openai-respond-settings-on-wire
   (let ((seen nil))
-    (flet ((capture (method url &key headers content)
+    (flet ((capture (method url &key headers content &allow-other-keys)
              (declare (ignore method headers))
              (ok (search "/responses" url))
              (setf seen (stack-json:decode content))
              (%fake-openai :post url :content content)))
-      (llm-protocol:respond
+      (llm-protocol:respond)
        (llm-protocol-openai:make-openai-compat-backend :request-fn #'capture)
        "hi"
        :settings '(:temperature 0 :max-tokens 16))
@@ -211,8 +537,12 @@
     (ok (capability-protocol:capability-supported-p cat :llm-structured-output))
     (ok (capability-protocol:capability-supported-p cat :llm-responses))
     (ng (capability-protocol:capability-supported-p cat :llm-video))
+    (ok (llm-protocol:backend-supports-p
+         (llm-protocol-openai:make-openai-compat-backend) :stream))
+    (ok (llm-protocol:backend-supports-p
+         (llm-protocol-openai:make-openai-compat-backend) :responses))
     (let ((gen (capability-protocol:get-capability cat :llm-generation)))
-      (ng (find 'capability-protocol:stream-complete
+      (ok (find 'capability-protocol:stream-complete
                 (capability-protocol:capability-operations gen)
                 :key #'capability-protocol:capability-operation-name)))))
 
@@ -263,13 +593,17 @@
                      (read-sequence buf stream)
                      (babel:octets-to-string buf :encoding :utf-8))))
            (url (format nil "http://fixture~a" target)))
-      (multiple-value-bind (status json)
+      (multiple-value-bind (status payload)
           (%fake-openai method url :headers nil :content (or body "{}"))
-        (let* ((octets (babel:string-to-octets json :encoding :utf-8))
+        (let* ((octets (babel:string-to-octets payload :encoding :utf-8))
+               (sse-p (or (eql 0 (search "data:" payload))
+                          (eql 0 (search "event:" payload))))
                (head (babel:string-to-octets
                       (format nil
-                              "HTTP/1.1 ~a OK~C~CContent-Type: application/json~C~CContent-Length: ~a~C~CConnection: close~C~C~C~C"
-                              status #\Return #\Newline #\Return #\Newline
+                              "HTTP/1.1 ~a OK~C~CContent-Type: ~a~C~CContent-Length: ~a~C~CConnection: close~C~C~C~C"
+                              status #\Return #\Newline
+                              (if sse-p "text/event-stream" "application/json")
+                              #\Return #\Newline
                               (length octets) #\Return #\Newline #\Return #\Newline
                               #\Return #\Newline))))
           (write-sequence head stream)
@@ -312,7 +646,12 @@
          (ok (equal "ok:hi" (llm-protocol:llm-response-text gen)))
          (ok (equal "ok:hi" (llm-protocol:llm-response-text res)))
          (ok (equal "resp_1" (llm-protocol:llm-response-id res)))
-         (ok (equal "local" (llm-protocol:llm-model-info-id (first models)))))))))
+         (ok (equal "local" (llm-protocol:llm-model-info-id (first models))))
+         (let ((sg (llm-protocol:stream-generate b "hi" :model "local"))
+               (sr (llm-protocol:stream-respond b "hi")))
+           (ok (equal "ok:hi" (llm-protocol:llm-response-text sg)))
+           (ok (equal "ok:hi" (llm-protocol:llm-response-text sr)))
+           (ok (equal "resp_1" (llm-protocol:llm-response-id sr))))))))
 
 (defun %live-p ()
   (let ((v (uiop:getenv "LLM_OPENAI_LIVE")))
@@ -343,3 +682,29 @@
           (ok (%live-ok r))
           (ok (plusp (length (or (llm-protocol:llm-response-id r) ""))))))
       (skip "set LLM_OPENAI_LIVE=1 for a live Responses call")))
+
+(deftest openai-live-stream-generate
+  (if (%live-p)
+      (%with-async-http
+        (let* ((seen nil)
+               (r (llm-protocol:stream-generate
+                   (llm-protocol-openai:make-openai-compat-backend)
+                   "Reply with the single word pong and nothing else."
+                   :settings '(:temperature 0 :max-tokens 256)
+                   :on-part (lambda (p) (push p seen)))))
+          (ok (%live-ok r))
+          (ok (plusp (length seen)))))
+      (skip "set LLM_OPENAI_LIVE=1 for a live streaming chat call")))
+
+(deftest openai-live-stream-respond
+  (if (%live-p)
+      (%with-async-http
+        (let* ((seen nil)
+               (r (llm-protocol:stream-respond
+                   (llm-protocol-openai:make-openai-compat-backend)
+                   "Reply with the single word pong and nothing else."
+                   :settings '(:temperature 0 :max-tokens 256)
+                   :on-part (lambda (p) (push p seen)))))
+          (ok (%live-ok r))
+          (ok (plusp (length (or (llm-protocol:llm-response-id r) ""))))))
+      (skip "set LLM_OPENAI_LIVE=1 for a live streaming Responses call")))
