@@ -486,7 +486,7 @@
 (deftest openai-stream-respond-chat-chunk-compat
   "LM Studio / proxies sometimes stream /responses as chat.completion.chunk."
   (flet ((compat (method url &key headers content &allow-other-keys)
-           (declare (ignore method headers))
+           (declare (ignore method headers content))
            (ok (search "/responses" url))
            (values 200 (%chat-sse "hi" :model "local"))))
     (let ((r (llm-protocol:stream-respond
@@ -511,7 +511,7 @@
              (ok (search "/responses" url))
              (setf seen (stack-json:decode content))
              (%fake-openai :post url :content content)))
-      (llm-protocol:respond)
+      (llm-protocol:respond
        (llm-protocol-openai:make-openai-compat-backend :request-fn #'capture)
        "hi"
        :settings '(:temperature 0 :max-tokens 16))
@@ -651,7 +651,7 @@
                (sr (llm-protocol:stream-respond b "hi")))
            (ok (equal "ok:hi" (llm-protocol:llm-response-text sg)))
            (ok (equal "ok:hi" (llm-protocol:llm-response-text sr)))
-           (ok (equal "resp_1" (llm-protocol:llm-response-id sr))))))))
+           (ok (equal "resp_1" (llm-protocol:llm-response-id sr)))))))))
 
 (defun %live-p ()
   (let ((v (uiop:getenv "LLM_OPENAI_LIVE")))
