@@ -55,6 +55,47 @@
             do (setf (gethash k h) v))
     h))
 
+(defun %wire-key (key)
+  (cond
+    ((stringp key) key)
+    ((or (keywordp key) (symbolp key))
+     (substitute #\_ #\- (string-downcase (symbol-name key))))
+    (t (princ-to-string key))))
+
+(defun %wire-extra-value (value)
+  (cond
+    ((eq value :omit) :omit)
+    ((keywordp value) (string-downcase (symbol-name value)))
+    ((hash-table-p value) value)
+    ((and (consp value) (keywordp (car value)))
+     (let ((h (make-hash-table :test 'equal)))
+       (loop for (k v) on value by #'cddr
+             unless (or (null k) (eq v :omit))
+               do (setf (gethash (%wire-key k) h) (%wire-extra-value v)))
+       h))
+    (t value)))
+
+(defun %apply-settings-extra (body settings)
+  "Merge LLM-SETTINGS-EXTRA onto BODY. First-class keys already present win.
+   NIL is kept (JSON false). Use :omit to skip a key."
+  (let ((extra (and settings (llm-settings-extra settings))))
+    (when extra
+      (flet ((put (k v)
+               (let ((key (%wire-key k))
+                     (val (%wire-extra-value v)))
+                 (unless (or (eq val :omit) (nth-value 1 (gethash key body)))
+                   (setf (gethash key body) val)))))
+        (cond
+          ((hash-table-p extra)
+           (maphash #'put extra))
+          ((and (consp extra) (or (keywordp (car extra)) (stringp (car extra))))
+           (loop for (k v) on extra by #'cddr
+                 do (put k v)))
+          (t (error 'llm-error
+                    :message (format nil "llm-settings-extra not a plist or hash: ~s"
+                                     extra)))))))
+  body)
+
 (defun %join (base path)
   (format nil "~a~a" (string-right-trim "/" (or base "")) path))
 
@@ -389,38 +430,40 @@
 (defun %chat-completion-body (backend turns &key model settings tools tool-choice
                               stream)
   (let* ((settings (coerce-settings settings))
-         (model (or model (openai-default-model backend))))
-    (values model
-            (%ht "model" model
-                 "messages" (map 'vector #'%wire-turn (coerce-turns turns))
-                 "temperature" (and settings (llm-settings-temperature settings))
-                 "max_tokens" (and settings (llm-settings-max-tokens settings))
-                 "stop" (and settings (llm-settings-stop settings))
-                 "top_p" (and settings (llm-settings-top-p settings))
-                 "response_format" (%wire-chat-response-format settings)
-                 "tools" (and tools (map 'vector #'%wire-tool
-                                         (llm-protocol::%as-list tools)))
-                 "tool_choice" (%wire-tool-choice tool-choice)
-                 "stream" (if stream t :omit)
-                 "stream_options" (if stream (%ht "include_usage" t) :omit)))))
+         (model (or model (openai-default-model backend)))
+         (body (%ht "model" model
+                    "messages" (map 'vector #'%wire-turn (coerce-turns turns))
+                    "temperature" (and settings (llm-settings-temperature settings))
+                    "max_tokens" (and settings (llm-settings-max-tokens settings))
+                    "stop" (and settings (llm-settings-stop settings))
+                    "top_p" (and settings (llm-settings-top-p settings))
+                    "response_format" (%wire-chat-response-format settings)
+                    "tools" (and tools (map 'vector #'%wire-tool
+                                            (llm-protocol::%as-list tools)))
+                    "tool_choice" (%wire-tool-choice tool-choice)
+                    "stream" (if stream t :omit)
+                    "stream_options" (if stream (%ht "include_usage" t) :omit))))
+    (%apply-settings-extra body settings)
+    (values model body)))
 
 (defun %responses-body (backend items &key model settings tools tool-choice stream)
   (let* ((settings (coerce-settings settings))
          (model (or model (openai-default-model backend)))
          (normalized (coerce-items items))
          (input (or (%scalar-user-input normalized)
-                    (map 'vector #'%wire-item normalized))))
-    (values model
-            (%ht "model" model
-                 "input" input
-                 "temperature" (and settings (llm-settings-temperature settings))
-                 "max_output_tokens" (and settings (llm-settings-max-tokens settings))
-                 "top_p" (and settings (llm-settings-top-p settings))
-                 "text" (%wire-responses-text settings)
-                 "tools" (and tools (map 'vector #'%wire-responses-tool
-                                         (llm-protocol::%as-list tools)))
-                 "tool_choice" (%wire-tool-choice tool-choice)
-                 "stream" (if stream t :omit)))))
+                    (map 'vector #'%wire-item normalized)))
+         (body (%ht "model" model
+                    "input" input
+                    "temperature" (and settings (llm-settings-temperature settings))
+                    "max_output_tokens" (and settings (llm-settings-max-tokens settings))
+                    "top_p" (and settings (llm-settings-top-p settings))
+                    "text" (%wire-responses-text settings)
+                    "tools" (and tools (map 'vector #'%wire-responses-tool
+                                            (llm-protocol::%as-list tools)))
+                    "tool_choice" (%wire-tool-choice tool-choice)
+                    "stream" (if stream t :omit))))
+    (%apply-settings-extra body settings)
+    (values model body)))
 
 (defmethod generate ((backend openai-compat-backend) turns &key model settings
                      tools tool-choice output)
