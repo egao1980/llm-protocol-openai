@@ -1,6 +1,6 @@
 # llm-protocol-openai
 
-OpenAI-compatible HTTP backend for [`llm-protocol`](https://github.com/egao1980/llm-protocol): `POST /chat/completions` (`generate`) and `POST /responses` (`respond`). Not the protocol.
+OpenAI-compatible HTTP backend for [`llm-protocol`](https://github.com/egao1980/llm-protocol): `POST /chat/completions` (`generate`), `POST /responses` (`respond`), `POST /embeddings` (`embed`). Not the protocol.
 
 Transport is `http-protocol` — bind [`http-backend-async`](https://github.com/egao1980/http-backend-async) × [`event-backend-libuv`](https://github.com/egao1980/event-backend-libuv). Dexador is maintenance; do not default to it.
 
@@ -20,10 +20,11 @@ Transport is `http-protocol` — bind [`http-backend-async`](https://github.com/
   (stack-llm:llm-response-text
    (stack-llm:respond b "ping" :settings '(:temperature 0 :max-tokens 32)))
   (stack-llm:stream-generate b "ping" :on-part #'print)
-  (stack-llm:stream-respond b "ping" :on-part #'print))
+  (stack-llm:stream-respond b "ping" :on-part #'print)
+  (stack-llm:embed-query b "ping"))
 ```
 
-`OPENAI_API_KEY` / `LM_API_TOKEN` / `OPENAI_BASE_URL` / `OPENAI_MODEL` fill omitted initargs. Default base is LM Studio `http://127.0.0.1:1234/v1`.
+`OPENAI_API_KEY` / `LM_API_TOKEN` / `OPENAI_BASE_URL` / `OPENAI_MODEL` / `OPENAI_EMBEDDING_MODEL` fill omitted initargs. Default chat model is `gpt-4o-mini`; embeddings default to `text-embedding-3-small`. Default base is LM Studio `http://127.0.0.1:1234/v1`. Wave-1 embeddings are float only.
 
 `llm-settings-extra` (plist or hash) is merged onto the JSON body after first-class fields. Kebab keywords → snake keys; keyword values → lowercase strings; nested plists → objects; `nil` → JSON false. First-class keys already on the body win. Responses escape hatch:
 

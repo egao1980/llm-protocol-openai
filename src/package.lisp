@@ -7,6 +7,8 @@
            #:openai-base-url
            #:openai-api-key
            #:openai-default-model
-           #:+default-openai-base-url+))
+           #:openai-embedding-model
+           #:+default-openai-base-url+
+           #:+default-openai-embedding-model+))
 
 (in-package #:llm-protocol-openai)
