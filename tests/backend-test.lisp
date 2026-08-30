@@ -244,6 +244,29 @@
     ((search "/models" url)
      (values 200 (stack-json:encode
                   (%ht "data" (vector (%ht "id" "local" "owned_by" "lmstudio"))))))
+    ((and (eq method :post) (search "/embeddings" url))
+     (let* ((body (stack-json:decode content))
+            (input (gethash "input" body))
+            (texts (if (stringp input) (list input) (llm-protocol::%as-list input)))
+            (dim (or (gethash "dimensions" body) 4))
+            (data (loop for text in texts for i from 0
+                        collect (%ht "object" "embedding"
+                                     "index" i
+                                     "embedding" (let ((v (make-array dim)))
+                                                   (dotimes (j dim)
+                                                     (setf (aref v j)
+                                                           (float (+ i j 1) 1d0)))
+                                                   (when (plusp (length text))
+                                                     (setf (aref v 0)
+                                                           (float (char-code (char text 0))
+                                                                  1d0)))
+                                                   v)))))
+       (values 200
+               (stack-json:encode
+                (%ht "model" (or (gethash "model" body) "text-embedding-3-small")
+                     "usage" (%ht "prompt_tokens" (reduce #'+ texts :key #'length)
+                                  "total_tokens" (reduce #'+ texts :key #'length))
+                     "data" (map 'vector #'identity data))))))
     (t (values 404 "{}"))))
 
 (defun %fake-openai-error (method url &key headers content want-stream)
@@ -594,10 +617,70 @@
          (llm-protocol-openai:make-openai-compat-backend) :stream))
     (ok (llm-protocol:backend-supports-p
          (llm-protocol-openai:make-openai-compat-backend) :responses))
+    (ok (llm-protocol:backend-supports-p
+         (llm-protocol-openai:make-openai-compat-backend) :embeddings))
+    (ok (capability-protocol:capability-supported-p cat :llm-embeddings))
     (let ((gen (capability-protocol:get-capability cat :llm-generation)))
       (ok (find 'capability-protocol:stream-complete
                 (capability-protocol:capability-operations gen)
                 :key #'capability-protocol:capability-operation-name)))))
+
+(deftest openai-embed-one
+  (let* ((b (llm-protocol-openai:make-openai-compat-backend
+             :request-fn #'%fake-openai
+             :embedding-model "text-embedding-3-small"))
+         (r (llm-protocol:embed b "ab" :dimensions 4)))
+    (ok (llm-protocol:llm-embed-result-p r))
+    (ok (equal "text-embedding-3-small" (llm-protocol:llm-embed-result-model r)))
+    (let ((v (llm-protocol:llm-embedding-vector
+              (first (llm-protocol:llm-embed-result-embeddings r)))))
+      (ok (= 4 (length v)))
+      (ok (= (float (char-code #\a) 1f0) (aref v 0))))
+    (ok (= 2 (llm-protocol:llm-usage-total-tokens
+              (llm-protocol:llm-embed-result-usage r))))))
+
+(deftest openai-embed-many-and-path
+  (let ((seen-url nil)
+        (seen-body nil))
+    (flet ((capture (method url &key headers content &allow-other-keys)
+             (declare (ignore method headers))
+             (setf seen-url url seen-body (stack-json:decode content))
+             (%fake-openai :post url :content content)))
+      (let* ((b (llm-protocol-openai:make-openai-compat-backend
+                 :base-url "http://example.invalid/v1"
+                 :request-fn #'capture))
+             (r (llm-protocol:embed b '("one" "two") :model "emb-2" :dimensions 3))
+             (embs (llm-protocol:llm-embed-result-embeddings r)))
+        (ok (search "/embeddings" seen-url))
+        (ok (equal "emb-2" (gethash "model" seen-body)))
+        (ok (= 2 (length (gethash "input" seen-body))))
+        (ok (= 3 (gethash "dimensions" seen-body)))
+        (ok (equal "float" (gethash "encoding_format" seen-body)))
+        (ok (= 2 (length embs)))
+        (ok (zerop (llm-protocol:llm-embedding-index (first embs))))
+        (ok (= 1 (llm-protocol:llm-embedding-index (second embs))))))))
+
+(deftest openai-embed-query
+  (let ((v (llm-protocol:embed-query
+            (llm-protocol-openai:make-openai-compat-backend
+             :request-fn #'%fake-openai)
+            "z" :dimensions 2)))
+    (ok (vectorp v))
+    (ok (= (float (char-code #\z) 1f0) (aref v 0)))))
+
+(deftest openai-embed-rejects-base64
+  (ok (signals (llm-protocol:embed
+                (llm-protocol-openai:make-openai-compat-backend
+                 :request-fn #'%fake-openai)
+                "hi" :encoding-format :base64)
+               'llm-protocol:llm-unsupported)))
+
+(deftest openai-embed-429
+  (ok (signals (llm-protocol:embed
+                (llm-protocol-openai:make-openai-compat-backend
+                 :request-fn #'%fake-openai-429)
+                "hi")
+               'llm-protocol:llm-http-error)))
 
 (defmacro %with-async-http (&body body)
   "Bind http-backend-async × libuv like http-parity WITH-PARITY."

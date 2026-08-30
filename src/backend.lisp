@@ -3,6 +3,8 @@
 (defparameter +default-openai-base-url+ "http://127.0.0.1:1234/v1"
   "LM Studio OpenAI-compatible default.")
 
+(defparameter +default-openai-embedding-model+ "text-embedding-3-small")
+
 (defun %env (name)
   (let ((v (uiop:getenv name)))
     (and v (plusp (length v)) v)))
@@ -13,16 +15,20 @@
    (api-key :initarg :api-key :accessor openai-api-key :initform nil)
    (default-model :initarg :default-model :accessor openai-default-model
                   :initform "gpt-4o-mini")
+   (embedding-model :initarg :embedding-model :accessor openai-embedding-model
+                    :initform +default-openai-embedding-model+)
    (organization :initarg :organization :accessor openai-organization :initform nil)
    (request-fn :initarg :request-fn :accessor openai-request-fn :initform nil)))
 
 (defun make-openai-compat-backend (&key base-url api-key default-model
-                                     organization request-fn)
+                                     embedding-model organization request-fn)
   (make-instance 'openai-compat-backend
                  :base-url (or base-url (%env "OPENAI_BASE_URL")
                                +default-openai-base-url+)
                  :api-key (or api-key (%env "OPENAI_API_KEY") (%env "LM_API_TOKEN"))
                  :default-model (or default-model (%env "OPENAI_MODEL") "gpt-4o-mini")
+                 :embedding-model (or embedding-model (%env "OPENAI_EMBEDDING_MODEL")
+                                      +default-openai-embedding-model+)
                  :organization (or organization (%env "OPENAI_ORGANIZATION"))
                  :request-fn request-fn))
 
@@ -46,6 +52,9 @@
   t)
 
 (defmethod backend-supports-p ((backend openai-compat-backend) (feature (eql :stream)))
+  t)
+
+(defmethod backend-supports-p ((backend openai-compat-backend) (feature (eql :embeddings)))
   t)
 
 (defun %ht (&rest kvs)
@@ -495,3 +504,44 @@
                  :id (if (hash-table-p m) (gethash "id" m) (princ-to-string m))
                  :owned-by (and (hash-table-p m) (gethash "owned_by" m))))
               (llm-protocol::%as-list data)))))
+
+(defun %float-vec (seq)
+  (map 'vector (lambda (x) (float x 1f0)) (llm-protocol::%as-list seq)))
+
+(defun %parse-embeddings (obj requested-model)
+  (let* ((raw (and (hash-table-p obj) (gethash "data" obj)))
+         (rows (sort (copy-list (llm-protocol::%as-list raw)) #'<
+                     :key (lambda (row)
+                            (or (and (hash-table-p row) (gethash "index" row)) 0))))
+         (embs (loop for row in rows
+                     for i from 0
+                     for vec = (and (hash-table-p row) (gethash "embedding" row))
+                     do (when (stringp vec)
+                          (error 'llm-unsupported
+                                 :message "base64 embeddings are not supported"))
+                     collect (make-llm-embedding
+                              :vector (%float-vec vec)
+                              :index (or (and (hash-table-p row) (gethash "index" row))
+                                         i)))))
+    (make-llm-embed-result
+     :embeddings embs
+     :model (or (and (hash-table-p obj) (gethash "model" obj)) requested-model)
+     :usage (%usage (and (hash-table-p obj) (gethash "usage" obj))))))
+
+(defmethod embed ((backend openai-compat-backend) inputs &key model dimensions
+                  encoding-format)
+  (when (and encoding-format
+             (not (member encoding-format '(:float "float") :test #'equal)))
+    (error 'llm-unsupported
+           :message (format nil "wave-1 embeddings are float-only, got ~s"
+                            encoding-format)))
+  (let* ((texts (coerce-embed-inputs inputs))
+         (model (or model (openai-embedding-model backend)))
+         (body (%ht "model" model
+                    "input" (if (null (rest texts)) (first texts)
+                                (map 'vector #'identity texts))
+                    "dimensions" (or dimensions :omit)
+                    "encoding_format" "float")))
+    (multiple-value-bind (status text)
+        (%request backend :post "/embeddings" body)
+      (%parse-embeddings (%decode status text) model))))
