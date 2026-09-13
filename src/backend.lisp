@@ -188,17 +188,73 @@
     ((stringp x) x)
     (t (princ-to-string x))))
 
+(defparameter +%b64-alphabet+
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+
+(defun %usb8-p (x)
+  (and (vectorp x)
+       (not (stringp x))
+       (or (zerop (length x))
+           (integerp (aref x 0)))))
+
+(defun %rfc4648-encode (octets)
+  (let* ((octets (coerce octets '(simple-array (unsigned-byte 8) (*))))
+         (n (length octets))
+         (out (make-string (* 4 (ceiling n 3)) :initial-element #\=)))
+    (loop with j = 0
+          for i from 0 below n by 3
+          for b0 = (aref octets i)
+          for b1 = (if (< (1+ i) n) (aref octets (1+ i)) 0)
+          for b2 = (if (< (+ i 2) n) (aref octets (+ i 2)) 0)
+          for triple = (logior (ash b0 16) (ash b1 8) b2)
+          do (setf (char out j) (char +%b64-alphabet+ (ldb (byte 6 18) triple))
+                   (char out (1+ j)) (char +%b64-alphabet+ (ldb (byte 6 12) triple)))
+             (when (< (1+ i) n)
+               (setf (char out (+ j 2))
+                     (char +%b64-alphabet+ (ldb (byte 6 6) triple))))
+             (when (< (+ i 2) n)
+               (setf (char out (+ j 3))
+                     (char +%b64-alphabet+ (ldb (byte 6 0) triple))))
+             (incf j 4))
+    out))
+
+(defun %image-data-base64 (part)
+  (let ((data (llm-image-part-data part)))
+    (cond
+      ((null data) nil)
+      ((and (stringp data) (eql 0 (search "data:" data))) data)
+      ((stringp data) data)
+      ((%usb8-p data) (%rfc4648-encode data))
+      (t (princ-to-string data)))))
+
+(defun %image-data-url (part)
+  (let ((data (%image-data-base64 part)))
+    (cond
+      ((null data) nil)
+      ((and (stringp data) (eql 0 (search "data:" data))) data)
+      (t (format nil "data:~a;base64,~a"
+                 (or (llm-image-part-media-type part) "image/png")
+                 data)))))
+
+(defun encode-image-part (part &key (style :chat))
+  "Encode LLM-IMAGE-PART for the OpenAI wire (url or base64 data + media-type).
+   :chat → {type:image_url, image_url:{url}}
+   :responses → {type:input_image, image_url}"
+  (check-type part llm-image-part)
+  (let ((url (or (llm-image-part-url part) (%image-data-url part))))
+    (ecase style
+      (:chat
+       (%ht "type" "image_url"
+            "image_url" (%ht "url" url)))
+      (:responses
+       (%ht "type" "input_image"
+            "image_url" url)))))
+
 (defgeneric %wire-part (part)
   (:method ((part llm-text-part))
     (%ht "type" "text" "text" (or (llm-text-part-text part) "")))
   (:method ((part llm-image-part))
-    (%ht "type" "image_url"
-         "image_url" (%ht "url" (or (llm-image-part-url part)
-                                    (and (llm-image-part-data part)
-                                         (format nil "data:~a;base64,~a"
-                                                 (or (llm-image-part-media-type part)
-                                                     "image/png")
-                                                 (llm-image-part-data part)))))))
+    (encode-image-part part :style :chat))
   (:method ((part llm-thinking-part))
     nil)
   (:method ((part llm-part))
@@ -289,13 +345,7 @@
      (%ht "type" (if inputp "input_text" "output_text")
           "text" (or (llm-text-part-text part) "")))
     (llm-image-part
-     (%ht "type" "input_image"
-          "image_url" (or (llm-image-part-url part)
-                          (and (llm-image-part-data part)
-                               (format nil "data:~a;base64,~a"
-                                       (or (llm-image-part-media-type part)
-                                           "image/png")
-                                       (llm-image-part-data part))))))
+     (encode-image-part part :style :responses))
     (llm-part nil)))
 
 (defun %wire-item (item)

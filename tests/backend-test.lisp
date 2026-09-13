@@ -844,3 +844,48 @@
           (ok (%live-ok r))
           (ok (plusp (length (or (llm-protocol:llm-response-id r) ""))))))
       (skip "set LLM_OPENAI_LIVE=1 for a live streaming Responses call")))
+
+(deftest encode-image-part-url
+  (let ((h (llm-protocol-openai:encode-image-part
+            (llm-protocol:make-llm-image-part :url "https://ex.test/a.png"))))
+    (ok (equal "image_url" (gethash "type" h)))
+    (ok (equal "https://ex.test/a.png"
+               (gethash "url" (gethash "image_url" h))))))
+
+(deftest encode-image-part-base64-octets
+  (let* ((octets (make-array 3 :element-type '(unsigned-byte 8)
+                             :initial-contents '(1 2 3)))
+         (h (llm-protocol-openai:encode-image-part
+             (llm-protocol:make-llm-image-part
+              :data octets :media-type "image/png")))
+         (url (gethash "url" (gethash "image_url" h))))
+    (ok (equal "image_url" (gethash "type" h)))
+    (ok (equal "data:image/png;base64,AQID" url))))
+
+(deftest encode-image-part-responses-style
+  (let ((h (llm-protocol-openai:encode-image-part
+            (llm-protocol:make-llm-image-part :url "https://ex.test/b.png")
+            :style :responses)))
+    (ok (equal "input_image" (gethash "type" h)))
+    (ok (equal "https://ex.test/b.png" (gethash "image_url" h)))))
+
+(deftest openai-image-part-on-wire
+  (let ((seen nil))
+    (flet ((capture (method url &key headers content &allow-other-keys)
+             (declare (ignore method url headers))
+             (setf seen (stack-json:decode content))
+             (%fake-openai :post "http://x/chat/completions" :content content)))
+      (llm-protocol:generate
+       (llm-protocol-openai:make-openai-compat-backend :request-fn #'capture)
+       (llm-protocol:make-llm-turn
+        :role :user
+        :parts (list (llm-protocol:make-llm-text-part :text "see")
+                     (llm-protocol:make-llm-image-part
+                      :url "https://ex.test/a.png"))))
+      (let* ((msgs (gethash "messages" seen))
+             (content (gethash "content" (elt msgs 0)))
+             (img (elt content 1)))
+        (ok (vectorp content))
+        (ok (equal "image_url" (gethash "type" img)))
+        (ok (equal "https://ex.test/a.png"
+                   (gethash "url" (gethash "image_url" img))))))))
