@@ -133,7 +133,7 @@
            :message "*http-backend* is nil — bind an http-protocol backend"))
   (let ((res (apply #'http:request method url
                     :headers headers
-                    :timeout 180
+                    :timeout 600
                     :want-stream (and want-stream t)
                     (and content (list :content content)))))
     (values (http-protocol:response-status res)

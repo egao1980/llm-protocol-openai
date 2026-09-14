@@ -2,7 +2,7 @@
 
 OpenAI-compatible HTTP backend for [`llm-protocol`](https://github.com/egao1980/llm-protocol): `POST /chat/completions` (`generate`), `POST /responses` (`respond`), `POST /embeddings` (`embed`). Not the protocol.
 
-Transport is `http-protocol` — bind [`http-backend-async`](https://github.com/egao1980/http-backend-async) × [`event-backend-libuv`](https://github.com/egao1980/event-backend-libuv). Dexador is maintenance; do not default to it.
+Transport is `http-protocol` — bind [`http-backend-async`](https://github.com/egao1980/http-backend-async) × [`event-backend-libuv`](https://github.com/egao1980/event-backend-libuv). Dexador is maintenance; do not default to it. `%http-request` uses a 600s total timeout (local 27B completions miss 180s).
 
 ```lisp
 (asdf:load-system "llm-protocol-openai")
