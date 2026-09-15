@@ -207,11 +207,9 @@
   "Apply catalog :min-completion-tokens as a floor on SETTINGS max-tokens."
   (let* ((requested (and settings (llm-settings-max-tokens settings)))
          (floor (openai-model-flag backend model :min-completion-tokens)))
-    (cond
-      ((and (integerp floor) (plusp floor) (integerp requested))
-       (max requested floor))
-      ((integerp requested) requested)
-      (t requested))))
+    (if (and (integerp floor) (plusp floor) (integerp requested))
+        (max requested floor)
+        requested)))
 
 (defun %maybe-reasoning-as-content (backend model content thinking)
   "When :reasoning-as-content is on and chat content is blank, use reasoning."
