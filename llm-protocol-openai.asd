@@ -1,5 +1,5 @@
 (defsystem "llm-protocol-openai"
-  :version "0.3.0"
+  :version "0.3.1"
   :description "OpenAI chat/completions + Responses + embeddings backend for llm-protocol"
   :author "egao1980"
   :license "MIT"
@@ -13,6 +13,7 @@
   :serial t
   :pathname "src"
   :components ((:file "package")
+               (:file "catalog")
                (:file "backend")
                (:file "stream"))
   :in-order-to ((test-op (test-op "llm-protocol-openai/tests"))))
