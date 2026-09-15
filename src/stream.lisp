@@ -148,10 +148,16 @@
     (values finish usage model)))
 
 (defun %assemble-chat-response (text thinking tools finish usage model
-                                requested-model on-part)
+                                requested-model on-part &optional backend)
   (let* ((think-s (get-output-stream-string thinking))
          (text-s (get-output-stream-string text))
          (calls (%tool-acc-parts tools)))
+    (let ((promoted (%maybe-reasoning-as-content backend requested-model
+                                                 text-s think-s)))
+      (when (and (not (eq promoted text-s))
+                 (not (%blank-text-p promoted)))
+        (setf text-s (%str promoted))
+        (%emit-part on-part (make-llm-text-part :text text-s))))
     (dolist (call calls)
       (%emit-part on-part call))
     (make-llm-response
@@ -164,7 +170,7 @@
      :finish-reason (if calls :tool-use (or finish :stop))
      :usage usage)))
 
-(defun %consume-chat-sse (body on-part requested-model)
+(defun %consume-chat-sse (body on-part requested-model &optional backend)
   (let ((text (make-string-output-stream))
         (thinking (make-string-output-stream))
         (tools (make-hash-table :test 'eql))
@@ -182,7 +188,7 @@
              (when chunk-usage (setf usage chunk-usage))
              (when chunk-model (setf seen-model chunk-model)))))))
     (%assemble-chat-response text thinking tools finish usage seen-model
-                             requested-model on-part)))
+                             requested-model on-part backend)))
 
 (defun %responses-delta (obj)
   (%str (or (and (hash-table-p obj) (gethash "delta" obj)) "")))
@@ -333,7 +339,7 @@
       (%chat-completion-body backend turns :model model :settings settings
                              :tools tools :tool-choice tool-choice :stream t)
     (%consume-chat-sse (%stream-body backend :post "/chat/completions" body)
-                       on-part model)))
+                       on-part model backend)))
 
 (defmethod stream-respond ((backend openai-compat-backend) items &key model
                            settings tools tool-choice on-part output)

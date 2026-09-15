@@ -298,6 +298,87 @@
       (ok (zerop (gethash "temperature" seen)))
       (ok (= 16 (gethash "max_tokens" seen))))))
 
+(deftest openai-min-completion-tokens-floor
+  (let ((seen nil))
+    (flet ((capture (method url &key headers content &allow-other-keys)
+             (declare (ignore method url headers))
+             (setf seen (stack-json:decode content))
+             (%fake-openai :post "http://x/chat/completions" :content content)))
+      (llm-protocol:generate
+       (llm-protocol-openai:make-openai-compat-backend
+        :request-fn #'capture
+        :model-catalog '(("local" :min-completion-tokens 128)))
+       "hi"
+       :model "local"
+       :settings '(:temperature 0 :max-tokens 16))
+      (ok (= 128 (gethash "max_tokens" seen)))
+      (llm-protocol:generate
+       (llm-protocol-openai:make-openai-compat-backend
+        :request-fn #'capture
+        :model-catalog '(("local" :min-completion-tokens 128)))
+       "hi"
+       :model "local"
+       :settings '(:max-tokens 256))
+      (ok (= 256 (gethash "max_tokens" seen))))))
+
+(deftest openai-min-completion-tokens-builtin-nemotron
+  (let ((seen nil))
+    (flet ((capture (method url &key headers content &allow-other-keys)
+             (declare (ignore method url headers))
+             (setf seen (stack-json:decode content))
+             (%fake-openai :post "http://x/chat/completions" :content content)))
+      (llm-protocol:generate
+       (llm-protocol-openai:make-openai-compat-backend :request-fn #'capture)
+       "hi"
+       :model "nemotron-3-nano-4b"
+       :settings '(:max-tokens 16))
+      (ok (= 128 (gethash "max_tokens" seen))))))
+
+(defun %fake-reasoning-only (method url &key headers content want-stream)
+  (declare (ignore method url headers want-stream))
+  (let* ((body (stack-json:decode content))
+         (model (or (gethash "model" body) "local")))
+    (values 200
+            (stack-json:encode
+             (%ht "model" model
+                  "usage" (%ht "prompt_tokens" 3 "completion_tokens" 2
+                               "total_tokens" 5)
+                  "choices"
+                  (vector (%ht "finish_reason" "stop"
+                               "message"
+                               (%ht "role" "assistant"
+                                    "content" ""
+                                    "reasoning_content" "the useful answer"))))))))
+
+(deftest openai-reasoning-as-content-on
+  (let ((r (llm-protocol:generate
+            (llm-protocol-openai:make-openai-compat-backend
+             :request-fn #'%fake-reasoning-only
+             :model-catalog '(("local" :reasoning-as-content t)))
+            "hi"
+            :model "local")))
+    (ok (equal "the useful answer" (llm-protocol:llm-response-text r)))
+    (ok (equal "the useful answer" (llm-protocol:llm-response-thinking r)))))
+
+(deftest openai-reasoning-as-content-off
+  (let ((r (llm-protocol:generate
+            (llm-protocol-openai:make-openai-compat-backend
+             :request-fn #'%fake-reasoning-only
+             :model-catalog nil)
+            "hi"
+            :model "local")))
+    (ok (equal "" (llm-protocol:llm-response-text r)))
+    (ok (equal "the useful answer" (llm-protocol:llm-response-thinking r)))))
+
+(deftest openai-reasoning-as-content-builtin-glm
+  (let ((r (llm-protocol:generate
+            (llm-protocol-openai:make-openai-compat-backend
+             :request-fn #'%fake-reasoning-only)
+            "hi"
+            :model "zai-org/glm-4.6v-flash")))
+    (ok (equal "the useful answer" (llm-protocol:llm-response-text r)))
+    (ok (equal "the useful answer" (llm-protocol:llm-response-thinking r)))))
+
 (deftest openai-output-schema-on-wire
   (let ((seen nil)
         (schema (let ((h (make-hash-table :test 'equal)))

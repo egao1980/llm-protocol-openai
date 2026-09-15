@@ -18,10 +18,13 @@
    (embedding-model :initarg :embedding-model :accessor openai-embedding-model
                     :initform +default-openai-embedding-model+)
    (organization :initarg :organization :accessor openai-organization :initform nil)
-   (request-fn :initarg :request-fn :accessor openai-request-fn :initform nil)))
+   (request-fn :initarg :request-fn :accessor openai-request-fn :initform nil)
+   (model-catalog :initarg :model-catalog :accessor openai-model-catalog
+                  :initform nil)))
 
 (defun make-openai-compat-backend (&key base-url api-key default-model
-                                     embedding-model organization request-fn)
+                                     embedding-model organization request-fn
+                                     (model-catalog nil model-catalog-supplied-p))
   (make-instance 'openai-compat-backend
                  :base-url (or base-url (%env "OPENAI_BASE_URL")
                                +default-openai-base-url+)
@@ -30,7 +33,16 @@
                  :embedding-model (or embedding-model (%env "OPENAI_EMBEDDING_MODEL")
                                       +default-openai-embedding-model+)
                  :organization (or organization (%env "OPENAI_ORGANIZATION"))
-                 :request-fn request-fn))
+                 :request-fn request-fn
+                 :model-catalog (if model-catalog-supplied-p
+                                    model-catalog
+                                    (copy-default-model-catalog))))
+
+(defun openai-model-flags (backend model)
+  (lookup-model-flags (openai-model-catalog backend) model))
+
+(defun openai-model-flag (backend model flag &optional default)
+  (model-catalog-flag (openai-model-catalog backend) model flag default))
 
 (defun use-openai-compat-backend (&rest args &key &allow-other-keys)
   (setf *llm-backend* (apply #'make-openai-compat-backend args)))
@@ -187,6 +199,28 @@
     ((or (null x) (eq x :null)) "")
     ((stringp x) x)
     (t (princ-to-string x))))
+
+(defun %blank-text-p (x)
+  (zerop (length (string-trim '(#\Space #\Tab #\Newline #\Return) (%str x)))))
+
+(defun %effective-max-tokens (backend model settings)
+  "Apply catalog :min-completion-tokens as a floor on SETTINGS max-tokens."
+  (let* ((requested (and settings (llm-settings-max-tokens settings)))
+         (floor (openai-model-flag backend model :min-completion-tokens)))
+    (cond
+      ((and (integerp floor) (plusp floor) (integerp requested))
+       (max requested floor))
+      ((integerp requested) requested)
+      (t requested))))
+
+(defun %maybe-reasoning-as-content (backend model content thinking)
+  "When :reasoning-as-content is on and chat content is blank, use reasoning."
+  (if (and backend
+           (openai-model-flag backend model :reasoning-as-content)
+           (%blank-text-p content)
+           (not (%blank-text-p thinking)))
+      (%str thinking)
+      content))
 
 (defparameter +%b64-alphabet+
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
@@ -397,14 +431,16 @@
      :output-tokens (or (gethash "completion_tokens" obj) (gethash "output_tokens" obj))
      :total-tokens (gethash "total_tokens" obj))))
 
-(defun %parse-response (obj requested-model)
+(defun %parse-response (obj requested-model &optional backend)
   (let* ((choice (let ((cs (gethash "choices" obj)))
                    (and cs (plusp (length cs)) (elt cs 0))))
          (msg (and choice (gethash "message" choice)))
-         (content (and msg (gethash "content" msg)))
+         (raw-content (and msg (gethash "content" msg)))
          (tcs (and msg (gethash "tool_calls" msg)))
          (thinking (and msg (or (gethash "reasoning_content" msg)
                                 (gethash "thinking" msg))))
+         (content (%maybe-reasoning-as-content backend requested-model
+                                               raw-content thinking))
          (parts (append
                  (and thinking (not (eq thinking :null))
                       (list (make-llm-thinking-part :text (%str thinking))))
@@ -493,7 +529,7 @@
          (body (%ht "model" model
                     "messages" (map 'vector #'%wire-turn (coerce-turns turns))
                     "temperature" (and settings (llm-settings-temperature settings))
-                    "max_tokens" (and settings (llm-settings-max-tokens settings))
+                    "max_tokens" (%effective-max-tokens backend model settings)
                     "stop" (and settings (llm-settings-stop settings))
                     "top_p" (and settings (llm-settings-top-p settings))
                     "response_format" (%wire-chat-response-format settings)
@@ -514,7 +550,7 @@
          (body (%ht "model" model
                     "input" input
                     "temperature" (and settings (llm-settings-temperature settings))
-                    "max_output_tokens" (and settings (llm-settings-max-tokens settings))
+                    "max_output_tokens" (%effective-max-tokens backend model settings)
                     "top_p" (and settings (llm-settings-top-p settings))
                     "text" (%wire-responses-text settings)
                     "tools" (and tools (map 'vector #'%wire-responses-tool
@@ -532,7 +568,7 @@
                              :tools tools :tool-choice tool-choice)
     (multiple-value-bind (status text)
         (%request backend :post "/chat/completions" body)
-      (%parse-response (%decode status text) model))))
+      (%parse-response (%decode status text) model backend))))
 
 (defmethod respond ((backend openai-compat-backend) items &key model settings
                     tools tool-choice output)

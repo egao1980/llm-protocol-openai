@@ -26,6 +26,13 @@ Transport is `http-protocol` — bind [`http-backend-async`](https://github.com/
 
 `OPENAI_API_KEY` / `LM_API_TOKEN` / `OPENAI_BASE_URL` / `OPENAI_MODEL` / `OPENAI_EMBEDDING_MODEL` fill omitted initargs. Default chat model is `gpt-4o-mini`; embeddings default to `text-embedding-3-small`. Default base is LM Studio `http://127.0.0.1:1234/v1`. Wave-1 embeddings are float only.
 
+Per-model flags live on the backend catalog (`openai-model-catalog`), not on `llm-model-info`. Built-ins: `nemotron-3-nano-4b` (`:min-completion-tokens` 128) and `zai-org/glm-4.6v-flash` (same floor plus `:reasoning-as-content`). `:min-completion-tokens` floors `max_tokens` / `max_output_tokens` so probe calls with a tiny budget do not empty `content` (`finish_reason: length`). `:reasoning-as-content` copies `reasoning_content` into assistant text when chat `content` is empty or whitespace. Pass `:model-catalog` to replace the built-ins; omit it to keep them.
+
+```lisp
+(stack-llm-openai:make-openai-compat-backend
+  :model-catalog '(("local" :min-completion-tokens 128 :reasoning-as-content t)))
+```
+
 `llm-settings-extra` (plist or hash) is merged onto the JSON body after first-class fields. Kebab keywords → snake keys; keyword values → lowercase strings; nested plists → objects; `nil` → JSON false. First-class keys already on the body win. Responses escape hatch:
 
 ```lisp
