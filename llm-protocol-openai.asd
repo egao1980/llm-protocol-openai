@@ -1,5 +1,5 @@
 (defsystem "llm-protocol-openai"
-  :version "0.3.1"
+  :version "0.3.2"
   :description "OpenAI chat/completions + Responses + embeddings backend for llm-protocol"
   :author "egao1980"
   :license "MIT"

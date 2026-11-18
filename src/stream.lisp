@@ -110,7 +110,7 @@
 
 (defun %stream-body (backend method path object)
   (multiple-value-bind (status body)
-      (%request backend method path object
+      (%request backend method path :object object
                 :want-stream t
                 :accept "text/event-stream")
     (unless (<= 200 status 299)

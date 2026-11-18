@@ -153,7 +153,7 @@
                 (http-protocol:response-body res)
                 (%body-string res)))))
 
-(defun %request (backend method path &optional object &key want-stream accept)
+(defun %request (backend method path &key object want-stream accept)
   (let* ((fn (or (openai-request-fn backend) #'%http-request))
          (url (%join (openai-base-url backend) path))
          (content (and object (stack-json:encode object)))
@@ -565,7 +565,7 @@
       (%chat-completion-body backend turns :model model :settings settings
                              :tools tools :tool-choice tool-choice)
     (multiple-value-bind (status text)
-        (%request backend :post "/chat/completions" body)
+        (%request backend :post "/chat/completions" :object body)
       (%parse-response (%decode status text) model backend))))
 
 (defmethod respond ((backend openai-compat-backend) items &key model settings
@@ -575,7 +575,7 @@
       (%responses-body backend items :model model :settings settings
                        :tools tools :tool-choice tool-choice)
     (multiple-value-bind (status text)
-        (%request backend :post "/responses" body)
+        (%request backend :post "/responses" :object body)
       (%parse-responses (%decode status text) model))))
 
 (defmethod list-models ((backend openai-compat-backend) &key)
@@ -627,5 +627,5 @@
                     "dimensions" (or dimensions :omit)
                     "encoding_format" "float")))
     (multiple-value-bind (status text)
-        (%request backend :post "/embeddings" body)
+        (%request backend :post "/embeddings" :object body)
       (%parse-embeddings (%decode status text) model))))
