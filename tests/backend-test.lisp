@@ -970,3 +970,171 @@
         (ok (equal "image_url" (gethash "type" img)))
         (ok (equal "https://ex.test/a.png"
                    (gethash "url" (gethash "image_url" img))))))))
+
+;;; --- prompt cache: prompt_cache_key + cached-token usage --------------------
+;;; OpenAI counts cached tokens inside prompt_tokens / input_tokens; llm-usage
+;;; keeps INPUT-TOKENS uncached, so 2006 prompt with 1920 cached → 86 + 1920.
+
+(defun %cached-chat-usage ()
+  (%ht "prompt_tokens" 2006 "completion_tokens" 300 "total_tokens" 2306
+       "prompt_tokens_details" (%ht "cached_tokens" 1920 "audio_tokens" 0)))
+
+(defun %cached-responses-usage ()
+  (%ht "input_tokens" 2006 "output_tokens" 300 "total_tokens" 2306
+       "input_tokens_details" (%ht "cached_tokens" 1920)
+       "output_tokens_details" (%ht "reasoning_tokens" 0)))
+
+(defun %fake-openai-cached (method url &key headers content want-stream)
+  (declare (ignore method headers content))
+  (cond
+    ((and want-stream (search "/chat/completions" url))
+     (values 200
+             (concatenate
+              'string
+              (%sse-block (stack-json:encode
+                           (%ht "model" "gpt-4o-mini"
+                                "choices" (vector (%ht "index" 0
+                                                       "delta" (%ht "content" "hi"))))))
+              (%sse-block (stack-json:encode
+                           (%ht "model" "gpt-4o-mini"
+                                "choices" (vector (%ht "index" 0 "delta" (%ht)
+                                                       "finish_reason" "stop")))))
+              ;; stream_options.include_usage: final chunk, empty choices.
+              (%sse-block (stack-json:encode
+                           (%ht "model" "gpt-4o-mini" "choices" (vector)
+                                "usage" (%cached-chat-usage))))
+              (%sse-block "[DONE]"))))
+    (want-stream
+     (values 200
+             (concatenate
+              'string
+              (%sse-block (stack-json:encode
+                           (%ht "type" "response.output_text.delta" "delta" "hi"))
+                          "response.output_text.delta")
+              (%sse-block
+               (stack-json:encode
+                (%ht "type" "response.completed"
+                     "response"
+                     (%ht "id" "resp_c" "model" "gpt-4o-mini" "status" "completed"
+                          "output" (vector
+                                    (%ht "type" "message" "role" "assistant"
+                                         "content" (vector (%ht "type" "output_text"
+                                                                "text" "hi"))))
+                          "usage" (%cached-responses-usage))))
+               "response.completed"))))
+    ((search "/chat/completions" url)
+     (values 200
+             (stack-json:encode
+              (%ht "model" "gpt-4o-mini"
+                   "choices" (vector (%ht "index" 0
+                                          "message" (%ht "role" "assistant"
+                                                         "content" "hi")
+                                          "finish_reason" "stop"))
+                   "usage" (%cached-chat-usage)))))
+    ((search "/responses" url)
+     (values 200
+             (stack-json:encode
+              (%ht "id" "resp_c" "model" "gpt-4o-mini" "status" "completed"
+                   "output" (vector
+                             (%ht "type" "message" "role" "assistant"
+                                  "content" (vector (%ht "type" "output_text"
+                                                         "text" "hi"))))
+                   "usage" (%cached-responses-usage)))))
+    (t (values 404 "{}"))))
+
+(defun %check-cached-usage (r)
+  (let ((u (llm-protocol:llm-response-usage r)))
+    (ok (llm-protocol:llm-usage-p u))
+    (ok (eql 86 (llm-protocol:llm-usage-input-tokens u)))
+    (ok (eql 1920 (llm-protocol:llm-usage-cache-read-tokens u)))
+    (ok (null (llm-protocol:llm-usage-cache-write-tokens u)))
+    (ok (eql 300 (llm-protocol:llm-usage-output-tokens u)))
+    (ok (eql 2306 (llm-protocol:llm-usage-total-tokens u)))
+    (ok (eql 2006 (llm-protocol:llm-usage-prompt-tokens u)))))
+
+(defun %cached-backend (&rest args)
+  (apply #'llm-protocol-openai:make-openai-compat-backend
+         :request-fn #'%fake-openai-cached args))
+
+(deftest openai-cached-usage-generate
+  (%check-cached-usage (llm-protocol:generate (%cached-backend) "hi")))
+
+(deftest openai-cached-usage-respond
+  (%check-cached-usage (llm-protocol:respond (%cached-backend) "hi")))
+
+(deftest openai-cached-usage-stream-generate
+  (%check-cached-usage (llm-protocol:stream-generate (%cached-backend) "hi")))
+
+(deftest openai-cached-usage-stream-respond
+  (%check-cached-usage (llm-protocol:stream-respond (%cached-backend) "hi")))
+
+(deftest openai-usage-without-details-unchanged
+  ;; No *_tokens_details: input stays the reported prompt count, no cache read.
+  (let ((u (llm-protocol:llm-response-usage
+            (llm-protocol:generate
+             (llm-protocol-openai:make-openai-compat-backend
+              :request-fn #'%fake-openai)
+             "hi"))))
+    (ok (eql 3 (llm-protocol:llm-usage-input-tokens u)))
+    (ok (null (llm-protocol:llm-usage-cache-read-tokens u)))))
+
+(defun %capture-bodies (fn)
+  "Call FN with a request-fn; → list of decoded request bodies, oldest first."
+  (let ((seen nil))
+    (funcall fn (lambda (method url &key headers content want-stream)
+                  (push (stack-json:decode content) seen)
+                  (%fake-openai-cached method url :headers headers
+                                                  :content content
+                                                  :want-stream want-stream)))
+    (nreverse seen)))
+
+(defun %all-four (backend-args settings)
+  "Bodies of generate / respond / stream-generate / stream-respond."
+  (%capture-bodies
+   (lambda (rf)
+     (let ((b (apply #'llm-protocol-openai:make-openai-compat-backend
+                     :request-fn rf backend-args)))
+       (llm-protocol:generate b "hi" :settings settings)
+       (llm-protocol:respond b "hi" :settings settings)
+       (llm-protocol:stream-generate b "hi" :settings settings)
+       (llm-protocol:stream-respond b "hi" :settings settings)))))
+
+(deftest openai-prompt-cache-key-default-absent
+  (let ((bodies (%all-four nil nil)))
+    (ok (= 4 (length bodies)))
+    (ok (every (lambda (b) (not (nth-value 1 (gethash "prompt_cache_key" b))))
+               bodies))))
+
+(deftest openai-prompt-cache-key-backend-default
+  (let ((b (llm-protocol-openai:make-openai-compat-backend
+            :prompt-cache-key "agent-run-1")))
+    (ok (equal "agent-run-1" (llm-protocol-openai:openai-prompt-cache-key b))))
+  (let ((bodies (%all-four '(:prompt-cache-key "agent-run-1") nil)))
+    (ok (= 4 (length bodies)))
+    (ok (every (lambda (b) (equal "agent-run-1" (gethash "prompt_cache_key" b)))
+               bodies))))
+
+(deftest openai-prompt-cache-key-per-request
+  (let ((bodies (%all-four '(:prompt-cache-key "agent-run-1")
+                           '(:extra (:prompt-cache-key "task-7")))))
+    (ok (every (lambda (b) (equal "task-7" (gethash "prompt_cache_key" b)))
+               bodies)))
+  ;; Hash-table extra with the wire spelling works too.
+  (let ((bodies (%all-four nil (llm-protocol:make-llm-settings
+                                :extra (%ht "prompt_cache_key" "task-8")))))
+    (ok (every (lambda (b) (equal "task-8" (gethash "prompt_cache_key" b)))
+               bodies))))
+
+(deftest openai-prompt-cache-key-per-request-off
+  ;; Extra NIL (or :omit) drops the backend default; never sent as JSON false.
+  (dolist (off '(nil :omit))
+    (let ((bodies (%all-four '(:prompt-cache-key "agent-run-1")
+                             (list :extra (list :prompt-cache-key off)))))
+      (ok (every (lambda (b) (not (nth-value 1 (gethash "prompt_cache_key" b))))
+                 bodies)))))
+
+(deftest openai-prompt-cache-retention-passthrough
+  (let ((bodies (%all-four '(:prompt-cache-key "k")
+                           '(:extra (:prompt-cache-retention "24h")))))
+    (ok (every (lambda (b) (equal "24h" (gethash "prompt_cache_retention" b)))
+               bodies))))

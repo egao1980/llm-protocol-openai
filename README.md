@@ -43,6 +43,14 @@ Per-model flags live on the backend catalog (`openai-model-catalog`), not on `ll
                       :store nil)))
 ```
 
+**Prompt cache.** OpenAI caches long prompt prefixes automatically; `prompt_cache_key` is the routing hint that keeps related requests (one agent run, one task) on the same cache. Set a backend default with `:prompt-cache-key "run-42"`, override it per call with settings `:extra (:prompt-cache-key "task-7")`, or drop it with `:extra (:prompt-cache-key nil)` (never sent as JSON false). It goes on `/chat/completions` and `/responses`, streamed or not. Other cache fields pass through extra unchanged, e.g. `:extra (:prompt-cache-retention "24h")`. Usage maps `prompt_tokens_details.cached_tokens` (chat) and `input_tokens_details.cached_tokens` (Responses, also the streamed final usage chunk and `response.completed`) to `llm-usage-cache-read-tokens`. OpenAI counts cached tokens inside the prompt total; `llm-usage-input-tokens` is the uncached share, so `llm-usage-prompt-tokens` gives the full prompt as on Anthropic. OpenAI reports no cache writes (`cache-write-tokens` stays `nil`).
+
+```lisp
+(let ((b (stack-llm-openai:make-openai-compat-backend :prompt-cache-key "run-42")))
+  (stack-llm:llm-usage-cache-read-tokens
+   (stack-llm:llm-response-usage (stack-llm:generate b "ping"))))
+```
+
 `stream-generate` → `POST /chat/completions` with `stream: true` (chat.completion.chunk SSE, `[DONE]`). `stream-respond` → `POST /responses` with `stream: true` (typed events: `response.output_text.delta`, `response.reasoning_text.delta` / `response.reasoning_summary_text.delta`, `response.function_call_arguments.*`, `response.completed` / `response.failed`). Compat servers that stream `/responses` as chat chunks are accepted. `:on-part` gets text/thinking deltas; assembled `llm-response` is returned at EOF.
 
 Tests: mock `request-fn` + a usocket fixture through async×libuv. Live LM Studio: `LLM_OPENAI_LIVE=1`. CI needs published `llm-protocol` on GHCR.
