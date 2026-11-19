@@ -9,6 +9,7 @@
            #:openai-default-model
            #:openai-embedding-model
            #:openai-model-catalog
+           #:openai-prompt-cache-key
            #:openai-model-flags
            #:openai-model-flag
            #:lookup-model-flags

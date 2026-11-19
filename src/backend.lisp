@@ -20,12 +20,20 @@
    (organization :initarg :organization :accessor openai-organization :initform nil)
    (request-fn :initarg :request-fn :accessor openai-request-fn :initform nil)
    (model-catalog :initarg :model-catalog :accessor openai-model-catalog
-                  :initform nil)))
+                  :initform nil)
+   (prompt-cache-key :initarg :prompt-cache-key :accessor openai-prompt-cache-key
+                     :initform nil
+                     :documentation "Default prompt_cache_key (string or NIL): the
+routing hint for OpenAI's automatic prefix cache, sent on /chat/completions and
+/responses. Per call: settings extra :prompt-cache-key (NIL or :omit drops it).")))
 
 (defun make-openai-compat-backend (&key base-url api-key default-model
                                      embedding-model organization request-fn
+                                     prompt-cache-key
                                      (model-catalog nil model-catalog-supplied-p))
+  (check-type prompt-cache-key (or null string))
   (make-instance 'openai-compat-backend
+                 :prompt-cache-key prompt-cache-key
                  :base-url (or base-url (%env "OPENAI_BASE_URL")
                                +default-openai-base-url+)
                  :api-key (or api-key (%env "OPENAI_API_KEY") (%env "LM_API_TOKEN"))
@@ -96,6 +104,10 @@
        h))
     (t value)))
 
+(defparameter +%extra-owned-keys+ '("prompt_cache_key")
+  "Extra keys the backend resolves itself (backend default + per-call
+override); %apply-settings-extra never copies them raw.")
+
 (defun %apply-settings-extra (body settings)
   "Merge LLM-SETTINGS-EXTRA onto BODY. First-class keys already present win.
    NIL is kept (JSON false). Use :omit to skip a key."
@@ -104,7 +116,8 @@
       (flet ((put (k v)
                (let ((key (%wire-key k))
                      (val (%wire-extra-value v)))
-                 (unless (or (eq val :omit) (nth-value 1 (gethash key body)))
+                 (unless (or (eq val :omit) (nth-value 1 (gethash key body))
+                             (member key +%extra-owned-keys+ :test #'equal))
                    (setf (gethash key body) val)))))
         (cond
           ((hash-table-p extra)
@@ -116,6 +129,36 @@
                     :message (format nil "llm-settings-extra not a plist or hash: ~s"
                                      extra)))))))
   body)
+
+(defun %settings-extra-get (settings key)
+  "→ (values value found-p) for KEY (a keyword) in SETTINGS extra.
+Matches kebab keywords and snake wire strings alike."
+  (let ((extra (and settings (llm-settings-extra settings)))
+        (wire (%wire-key key)))
+    (flet ((hit-p (k) (equal (%wire-key k) wire)))
+      (cond
+        ((hash-table-p extra)
+         (block found
+           (maphash (lambda (k v) (when (hit-p k) (return-from found (values v t))))
+                    extra)
+           (values nil nil)))
+        ((consp extra)
+         (loop for (k v) on extra by #'cddr
+               when (hit-p k) return (values v t)
+               finally (return (values nil nil))))
+        (t (values nil nil))))))
+
+(defun %prompt-cache-key (backend settings)
+  "prompt_cache_key for this call: settings extra :prompt-cache-key, else the
+backend default. NIL or :omit in extra means none."
+  (multiple-value-bind (v found) (%settings-extra-get settings :prompt-cache-key)
+    (let ((key (if found v (openai-prompt-cache-key backend))))
+      (cond
+        ((or (null key) (eq key :omit)) nil)
+        ((stringp key) key)
+        (t (error 'llm-error
+                  :message (format nil "prompt-cache-key must be a string, got ~s"
+                                   key)))))))
 
 (defun %join (base path)
   (format nil "~a~a" (string-right-trim "/" (or base "")) path))
@@ -422,12 +465,29 @@
     ((string-equal raw "content_filter") :content-filter)
     (t :stop)))
 
+(defun %cached-tokens (obj)
+  "cached_tokens from prompt_tokens_details (chat) or input_tokens_details
+(responses), or NIL when the provider did not report it."
+  (loop for key in '("prompt_tokens_details" "input_tokens_details")
+        for details = (gethash key obj)
+        for n = (and (hash-table-p details) (gethash "cached_tokens" details))
+        when (integerp n) return n))
+
 (defun %usage (obj)
+  "OpenAI counts cached tokens inside prompt_tokens / input_tokens; llm-usage
+keeps INPUT-TOKENS uncached and puts the cached share in CACHE-READ-TOKENS, so
+LLM-USAGE-PROMPT-TOKENS is the reported prompt size. OpenAI reports no cache
+writes. TOTAL-TOKENS is passed through."
   (when (hash-table-p obj)
-    (make-llm-usage
-     :input-tokens (or (gethash "prompt_tokens" obj) (gethash "input_tokens" obj))
-     :output-tokens (or (gethash "completion_tokens" obj) (gethash "output_tokens" obj))
-     :total-tokens (gethash "total_tokens" obj))))
+    (let ((prompt (or (gethash "prompt_tokens" obj) (gethash "input_tokens" obj)))
+          (cached (%cached-tokens obj)))
+      (make-llm-usage
+       :input-tokens (if (and (integerp prompt) cached)
+                         (max 0 (- prompt cached))
+                         prompt)
+       :output-tokens (or (gethash "completion_tokens" obj) (gethash "output_tokens" obj))
+       :total-tokens (gethash "total_tokens" obj)
+       :cache-read-tokens cached))))
 
 (defun %parse-response (obj requested-model &optional backend)
   (let* ((choice (let ((cs (gethash "choices" obj)))
@@ -534,6 +594,7 @@
                     "tools" (and tools (map 'vector #'%wire-tool
                                             (llm-protocol::%as-list tools)))
                     "tool_choice" (%wire-tool-choice tool-choice)
+                    "prompt_cache_key" (%prompt-cache-key backend settings)
                     "stream" (if stream t :omit)
                     "stream_options" (if stream (%ht "include_usage" t) :omit))))
     (%apply-settings-extra body settings)
@@ -554,6 +615,7 @@
                     "tools" (and tools (map 'vector #'%wire-responses-tool
                                             (llm-protocol::%as-list tools)))
                     "tool_choice" (%wire-tool-choice tool-choice)
+                    "prompt_cache_key" (%prompt-cache-key backend settings)
                     "stream" (if stream t :omit))))
     (%apply-settings-extra body settings)
     (values model body)))
