@@ -12,7 +12,9 @@
 (defclass openai-compat-backend (llm-backend)
   ((base-url :initarg :base-url :accessor openai-base-url
              :initform +default-openai-base-url+)
-   (api-key :initarg :api-key :accessor openai-api-key :initform nil)
+   (api-key :initarg :api-key :initform nil
+            :documentation "NIL or an HTTP-PROTOCOL:SECRET (prints redacted).
+OPENAI-API-KEY reads the plain string.")
    (default-model :initarg :default-model :accessor openai-default-model
                   :initform "gpt-4o-mini")
    (embedding-model :initarg :embedding-model :accessor openai-embedding-model
@@ -27,7 +29,40 @@
 routing hint for OpenAI's automatic prefix cache, sent on /chat/completions and
 /responses. Per call: settings extra :prompt-cache-key (NIL or :omit drops it).")))
 
-(defun make-openai-compat-backend (&key base-url api-key default-model
+(defun %resolve-api-key (value supplied-p &rest env-names)
+  "API key from a constructor argument (llm-protocol#10).
+   Not supplied, or :ENV → the first non-empty ENV-NAMES variable.
+   NIL or :NONE → no key: the environment is not read.
+   A string or HTTP-PROTOCOL:SECRET → that key (an empty string is no key)."
+  (cond ((or (not supplied-p) (eq value :env))
+         (some #'%env env-names))
+        ((or (null value) (eq value :none)) nil)
+        ((http-protocol:secret-p value) value)
+        ((stringp value) (and (plusp (length value)) value))
+        (t (error 'llm-error
+                  :message (format nil "api-key must be a string, NIL, :none or :env, got a ~(~A~)"
+                                   (type-of value))))))
+
+(defun %key-secret (value)
+  "VALUE (string, SECRET or NIL) as a SECRET, or NIL."
+  (let ((v (http-protocol:reveal value)))
+    (and (stringp v) (plusp (length v)) (http-protocol:make-secret value))))
+
+(defmethod initialize-instance :after ((b openai-compat-backend) &key)
+  (setf (slot-value b 'api-key) (%key-secret (slot-value b 'api-key))))
+
+(defgeneric openai-api-key (backend)
+  (:documentation "The plain API key string, or NIL.")
+  (:method ((b openai-compat-backend))
+    (http-protocol:reveal (slot-value b 'api-key))))
+
+(defgeneric (setf openai-api-key) (value backend)
+  (:documentation "Set the key: a string, an HTTP-PROTOCOL:SECRET, or NIL.")
+  (:method (value (b openai-compat-backend))
+    (setf (slot-value b 'api-key) (%key-secret value))
+    value))
+
+(defun make-openai-compat-backend (&key base-url (api-key nil api-key-p) default-model
                                      embedding-model organization request-fn
                                      prompt-cache-key
                                      (model-catalog nil model-catalog-supplied-p))
@@ -36,7 +71,7 @@ routing hint for OpenAI's automatic prefix cache, sent on /chat/completions and
                  :prompt-cache-key prompt-cache-key
                  :base-url (or base-url (%env "OPENAI_BASE_URL")
                                +default-openai-base-url+)
-                 :api-key (or api-key (%env "OPENAI_API_KEY") (%env "LM_API_TOKEN"))
+                 :api-key (%resolve-api-key api-key api-key-p "OPENAI_API_KEY" "LM_API_TOKEN")
                  :default-model (or default-model (%env "OPENAI_MODEL") "gpt-4o-mini")
                  :embedding-model (or embedding-model (%env "OPENAI_EMBEDDING_MODEL")
                                       +default-openai-embedding-model+)
@@ -166,10 +201,13 @@ backend default. NIL or :omit in extra means none."
 (defun %headers (backend &key (accept "application/json"))
   (let ((h `(("content-type" . "application/json")
              ("accept" . ,accept))))
-    (when (and (openai-api-key backend) (plusp (length (openai-api-key backend))))
-      (push (cons "authorization"
-                  (format nil "Bearer ~a" (openai-api-key backend)))
-            h))
+    (let ((key (slot-value backend 'api-key)))
+      (when key
+        ;; a SECRET: backtraces and conditions print it redacted (#54)
+        (push (cons "authorization"
+                    (http-protocol:make-secret
+                     (concatenate 'string "Bearer " (http-protocol:reveal key))))
+              h)))
     (when (openai-organization backend)
       (push (cons "openai-organization" (openai-organization backend)) h))
     h))

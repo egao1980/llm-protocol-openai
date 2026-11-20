@@ -26,6 +26,8 @@ Transport is `http-protocol` — bind [`http-backend-async`](https://github.com/
 
 `OPENAI_API_KEY` / `LM_API_TOKEN` / `OPENAI_BASE_URL` / `OPENAI_MODEL` / `OPENAI_EMBEDDING_MODEL` fill omitted initargs. Default chat model is `gpt-4o-mini`; embeddings default to `text-embedding-3-small`. Default base is LM Studio `http://127.0.0.1:1234/v1`. Wave-1 embeddings are float only.
 
+**API key** (`:api-key`): left out, or `:env`, reads `OPENAI_API_KEY` then `LM_API_TOKEN`. `nil`, `:none` or `""` means no key: no `Authorization` header, and the environment is not read. A string or an `http-protocol:secret` is used as given. The backend keeps the key as a `secret`, and the `Authorization` header value is a `secret` too, so backtraces, condition reports and `describe` print `#<SECRET [redacted]>`. `openai-api-key` returns the plain string. A custom `:request-fn` gets header values that may be secrets: call `http-protocol:reveal` on them.
+
 Per-model flags live on the backend catalog (`openai-model-catalog`), not on `llm-model-info`. Built-ins: `nemotron-3-nano-4b` (`:min-completion-tokens` 128) and `zai-org/glm-4.6v-flash` (same floor plus `:reasoning-as-content`). `:min-completion-tokens` floors `max_tokens` / `max_output_tokens` so probe calls with a tiny budget do not empty `content` (`finish_reason: length`). `:reasoning-as-content` copies `reasoning_content` into assistant text when chat `content` is empty or whitespace. Pass `:model-catalog` to replace the built-ins; omit it to keep them.
 
 ```lisp
