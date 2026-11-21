@@ -55,6 +55,8 @@ Per-model flags live on the backend catalog (`openai-model-catalog`), not on `ll
 
 `stream-generate` → `POST /chat/completions` with `stream: true` (chat.completion.chunk SSE, `[DONE]`). `stream-respond` → `POST /responses` with `stream: true` (typed events: `response.output_text.delta`, `response.reasoning_text.delta` / `response.reasoning_summary_text.delta`, `response.function_call_arguments.*`, `response.completed` / `response.failed`). Compat servers that stream `/responses` as chat chunks are accepted. `:on-part` gets text/thinking deltas; assembled `llm-response` is returned at EOF.
 
+**Truncated streams.** The stream must end on a terminal signal. Chat: a `finish_reason` in some chunk (with or without `[DONE]`: success with that reason) or `[DONE]` alone (success, `:stop`, or `:tool-use` when calls arrived). Responses: `response.completed` / `response.incomplete` (or `[DONE]`, or for chat-style chunks the chat rule). A body that closes without one, empty or cut mid-text or mid-tool-call, signals `llm-protocol:llm-incomplete-response` (an `llm-http-error`, retryable, so `with-auto-retry` and `call-with-retry-policy` re-run the call). `llm-incomplete-response-partial` holds what arrived, finish reason `:incomplete`; restart `use-partial-response` (`invoke-use-partial-response`) returns it, `use-value` substitutes another response. Half-built tool calls are kept in the partial response but never sent to `:on-part`. The non-streaming path is unchanged.
+
 Tests: mock `request-fn` + a usocket fixture through async×libuv. Live LM Studio: `LLM_OPENAI_LIVE=1`. CI needs published `llm-protocol` on GHCR.
 
 Part of [cl-stack](https://github.com/egao1980/cl-stack) ([#195](https://github.com/egao1980/cl-stack/issues/195)).
