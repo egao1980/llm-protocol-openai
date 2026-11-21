@@ -46,6 +46,22 @@
                    (not (string-equal trimmed "[DONE]")))
           (ignore-errors (stack-json:decode trimmed)))))))
 
+(defun %sse-done-p (event)
+  "T when EVENT is the chat-completions end sentinel `data: [DONE]`."
+  (let ((data (and event (sse-protocol:sse-event-data event))))
+    (and (stringp data)
+         (string-equal (string-trim '(#\Space #\Tab #\Newline #\Return) data)
+                       "[DONE]"))))
+
+(defun %signal-truncated-stream (response what)
+  "The stream closed before WHAT arrived. Mark RESPONSE :INCOMPLETE and
+signal LLM-INCOMPLETE-RESPONSE with it; USE-PARTIAL-RESPONSE returns it."
+  (setf (llm-response-finish-reason response) :incomplete)
+  (signal-incomplete-response
+   response
+   :message (format nil "stream closed before ~a (~d part~:p received)"
+                    what (length (llm-response-parts response)))))
+
 (defun %sse-event-type (event obj)
   (or (and event (sse-protocol:sse-event-type event))
       (and (hash-table-p obj) (gethash "type" obj))))
@@ -149,7 +165,12 @@
     (values finish usage model)))
 
 (defun %assemble-chat-response (text thinking tools finish usage model
-                                requested-model on-part &optional backend)
+                                requested-model on-part
+                                &key backend (complete t))
+  "Build the LLM-RESPONSE from the accumulated stream state. When COMPLETE is
+false the stream was cut short: the (possibly half-built) tool calls are kept
+in the response but not emitted to ON-PART, so a streaming consumer never
+sees a call it might run before the condition is handled."
   (let* ((think-s (get-output-stream-string thinking))
          (text-s (get-output-stream-string text))
          (calls (%tool-acc-parts tools)))
@@ -159,8 +180,9 @@
                  (not (%blank-text-p promoted)))
         (setf text-s (%str promoted))
         (%emit-part on-part (make-llm-text-part :text text-s))))
-    (dolist (call calls)
-      (%emit-part on-part call))
+    (when complete
+      (dolist (call calls)
+        (%emit-part on-part call)))
     (make-llm-response
      :parts (append (and (plusp (length think-s))
                          (list (make-llm-thinking-part :text think-s)))
@@ -172,24 +194,40 @@
      :usage usage)))
 
 (defun %consume-chat-sse (body on-part requested-model &optional backend)
+  "Assemble a streamed chat completion. Terminal signal = a finish_reason in
+some chunk, or `data: [DONE]`:
+  finish_reason, with or without [DONE] -> success with that reason;
+  [DONE] without finish_reason          -> success, :STOP (:TOOL-USE with calls);
+  neither (closed or cut stream)        -> LLM-INCOMPLETE-RESPONSE carrying the
+                                           partial response (:INCOMPLETE);
+                                           USE-PARTIAL-RESPONSE returns it."
   (let ((text (make-string-output-stream))
         (thinking (make-string-output-stream))
         (tools (make-hash-table :test 'eql))
-        (finish :stop)
+        (finish nil)
+        (done nil)
         (usage nil)
         (seen-model nil))
     (%map-sse
      body
      (lambda (event)
-       (let ((obj (%sse-json event)))
-         (when (hash-table-p obj)
-           (multiple-value-bind (chunk-finish chunk-usage chunk-model)
-               (%apply-chat-chunk obj text thinking tools on-part)
-             (when chunk-finish (setf finish chunk-finish))
-             (when chunk-usage (setf usage chunk-usage))
-             (when chunk-model (setf seen-model chunk-model)))))))
-    (%assemble-chat-response text thinking tools finish usage seen-model
-                             requested-model on-part backend)))
+       (if (%sse-done-p event)
+           (setf done t)
+           (let ((obj (%sse-json event)))
+             (when (hash-table-p obj)
+               (multiple-value-bind (chunk-finish chunk-usage chunk-model)
+                   (%apply-chat-chunk obj text thinking tools on-part)
+                 (when chunk-finish (setf finish chunk-finish))
+                 (when chunk-usage (setf usage chunk-usage))
+                 (when chunk-model (setf seen-model chunk-model))))))))
+    (let* ((complete (or finish done))
+           (response (%assemble-chat-response
+                      text thinking tools finish usage seen-model
+                      requested-model on-part
+                      :backend backend :complete complete)))
+      (if complete
+          response
+          (%signal-truncated-stream response "a finish_reason or [DONE]")))))
 
 (defun %responses-delta (obj)
   (%str (or (and (hash-table-p obj) (gethash "delta" obj)) "")))
@@ -230,12 +268,14 @@
         (seen-model nil)
         (usage nil)
         (id nil)
-        (finish :stop)
+        (finish nil)
+        (done nil)
         (chat-style nil))
     (%map-sse
      body
      (lambda (event)
-       (let ((obj (%sse-json event)))
+       (let ((obj (unless (and (%sse-done-p event) (setf done t))
+                    (%sse-json event))))
          (when (hash-table-p obj)
            (cond
              ((%chat-chunk-p obj)
@@ -315,23 +355,37 @@
              (%emit-part on-part part)))
          r))
       (t
-       (let* ((think-s (get-output-stream-string thinking))
+       ;; No response.completed / response.incomplete. Chat-style chunks end
+       ;; on a finish_reason or [DONE] as in %CONSUME-CHAT-SSE; a native
+       ;; Responses stream (or a compat one ending on [DONE]) without its
+       ;; terminal event was cut short.
+       (let* ((complete (or done (and chat-style finish)))
+              (think-s (get-output-stream-string thinking))
               (text-s (get-output-stream-string text))
-              (calls (or (nreverse emitted-tools) (%tool-acc-parts tools))))
-         (unless emitted-tools
+              (calls (or (reverse emitted-tools) (%tool-acc-parts tools))))
+         (when (and complete (not emitted-tools))
            (dolist (call calls)
              (%emit-part on-part call)))
-         (make-llm-response
-          :id id
-          :items (unless chat-style (%items-from-stream think-s text-s calls))
-          :parts (append (and (plusp (length think-s))
-                              (list (make-llm-thinking-part :text think-s)))
-                         (and (plusp (length text-s))
-                              (list (make-llm-text-part :text text-s)))
-                         calls)
-          :model (or seen-model requested-model)
-          :finish-reason (if calls :tool-use finish)
-          :usage usage))))))
+         (let ((response
+                 (make-llm-response
+                  :id id
+                  :items (unless chat-style
+                           (%items-from-stream think-s text-s calls))
+                  :parts (append (and (plusp (length think-s))
+                                      (list (make-llm-thinking-part :text think-s)))
+                                 (and (plusp (length text-s))
+                                      (list (make-llm-text-part :text text-s)))
+                                 calls)
+                  :model (or seen-model requested-model)
+                  :finish-reason (if calls :tool-use (or finish :stop))
+                  :usage usage)))
+           (if complete
+               response
+               (%signal-truncated-stream
+                response
+                (if chat-style
+                    "a finish_reason or [DONE]"
+                    "response.completed")))))))))
 
 (defmethod stream-generate ((backend openai-compat-backend) turns &key model
                             settings tools tool-choice on-part output)
