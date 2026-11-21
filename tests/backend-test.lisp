@@ -379,6 +379,66 @@
     (ok (equal "the useful answer" (llm-protocol:llm-response-text r)))
     (ok (equal "the useful answer" (llm-protocol:llm-response-thinking r)))))
 
+(defun %fake-null-tool-calls (method url &key headers content want-stream)
+  "Unsloth Studio style: explicit JSON nulls for tool_calls, refusal, audio."
+  (declare (ignore method url headers want-stream))
+  (let* ((body (stack-json:decode content))
+         (model (or (gethash "model" body) "local")))
+    (if (gethash "stream" body)
+        (values 200
+                (concatenate
+                 'string
+                 (%sse-block
+                  (stack-json:encode
+                   (%ht "model" model
+                        "choices"
+                        (vector (%ht "finish_reason" :null
+                                     "delta" (%ht "role" "assistant"
+                                                  "content" "Hi"
+                                                  "reasoning_content" :null
+                                                  "tool_calls" :null))))))
+                 (%sse-block
+                  (stack-json:encode
+                   (%ht "model" model
+                        "choices"
+                        (vector (%ht "finish_reason" "stop"
+                                     "delta" (%ht "content" "!"
+                                                  "tool_calls" :null))))))
+                 (%sse-block "[DONE]")))
+        (values 200
+                (stack-json:encode
+                 (%ht "model" model
+                      "usage" (%ht "prompt_tokens" 3 "completion_tokens" 2
+                                   "total_tokens" 5)
+                      "choices"
+                      (vector (%ht "finish_reason" "stop"
+                                   "message"
+                                   (%ht "role" "assistant"
+                                        "content" "Hi!"
+                                        "refusal" :null
+                                        "reasoning_content" "greet"
+                                        "tool_calls" :null
+                                        "audio" :null)))))))))
+
+(deftest openai-null-tool-calls
+  (let ((r (llm-protocol:generate
+            (llm-protocol-openai:make-openai-compat-backend
+             :request-fn #'%fake-null-tool-calls)
+            "hi" :model "local")))
+    (ok (equal "Hi!" (llm-protocol:llm-response-text r)))
+    (ok (equal "greet" (llm-protocol:llm-response-thinking r)))
+    (ok (null (llm-protocol:llm-response-tool-calls r)))
+    (ok (eq :stop (llm-protocol:llm-response-finish-reason r)))))
+
+(deftest openai-stream-null-tool-calls
+  (let ((r (llm-protocol:stream-generate
+            (llm-protocol-openai:make-openai-compat-backend
+             :request-fn #'%fake-null-tool-calls)
+            "hi" :model "local")))
+    (ok (equal "Hi!" (llm-protocol:llm-response-text r)))
+    (ok (null (llm-protocol:llm-response-tool-calls r)))
+    (ok (eq :stop (llm-protocol:llm-response-finish-reason r)))))
+
 (deftest openai-output-schema-on-wire
   (let ((seen nil)
         (schema (let ((h (make-hash-table :test 'equal)))

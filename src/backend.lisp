@@ -532,7 +532,9 @@ writes. TOTAL-TOKENS is passed through."
                    (and cs (plusp (length cs)) (elt cs 0))))
          (msg (and choice (gethash "message" choice)))
          (raw-content (and msg (gethash "content" msg)))
-         (tcs (and msg (gethash "tool_calls" msg)))
+         (tcs (let ((v (and msg (gethash "tool_calls" msg))))
+                ;; Some servers send "tool_calls": null on a text answer.
+                (if (eq v :null) nil v)))
          (thinking (and msg (or (gethash "reasoning_content" msg)
                                 (gethash "thinking" msg))))
          (content (%maybe-reasoning-as-content backend requested-model
