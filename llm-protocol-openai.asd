@@ -1,5 +1,5 @@
 (defsystem "llm-protocol-openai"
-  :version "0.6.0"
+  :version "0.7.0"
   :description "OpenAI chat/completions + Responses + embeddings backend for llm-protocol"
   :author "egao1980"
   :license "MIT"
@@ -20,14 +20,15 @@
 
 (defsystem "llm-protocol-openai/tests"
   :depends-on ("llm-protocol-openai" "llm-protocol/capability"
-               "http-backend-async" "event-backend-libuv"
+               (:version "http-backend-async" "0.2.25") "event-backend-libuv"
                "usocket" "bordeaux-threads" "rove")
   :pathname "tests"
   :serial t
   :components ((:file "package")
                (:file "backend-test")
                (:file "keys-test")
-               (:file "stream-incomplete-test"))
+               (:file "stream-incomplete-test")
+               (:file "timeout-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))
