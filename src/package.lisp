@@ -10,6 +10,12 @@
            #:openai-embedding-model
            #:openai-model-catalog
            #:openai-prompt-cache-key
+           #:openai-request-timeout
+           #:openai-stream-idle-timeout
+           #:openai-connect-timeout
+           #:+default-openai-request-timeout+
+           #:+default-openai-stream-idle-timeout+
+           #:+default-openai-connect-timeout+
            #:openai-model-flags
            #:openai-model-flag
            #:lookup-model-flags

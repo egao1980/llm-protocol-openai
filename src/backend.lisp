@@ -9,6 +9,52 @@
   (let ((v (uiop:getenv name)))
     (and v (plusp (length v)) v)))
 
+(defparameter +default-openai-request-timeout+ 600
+  "Seconds a non-streaming request may take in all (the model generates the
+whole answer before the first byte).")
+
+(defparameter +default-openai-stream-idle-timeout+ 300
+  "Seconds a streaming response may stay silent. A stream that keeps
+producing tokens is never cut off, however long it runs.")
+
+(defparameter +default-openai-connect-timeout+ 30
+  "Seconds to establish TCP / TLS.")
+
+(defun %timeout-seconds-value (value what)
+  "VALUE as seconds: a positive real, or NIL for no limit (0 too)."
+  (cond ((null value) nil)
+        ((and (realp value) (zerop value)) nil)
+        ((and (realp value) (plusp value)) value)
+        (t (error 'llm-error
+                  :message (format nil "~a must be seconds (a positive number) or NIL, got ~s"
+                                   what value)))))
+
+(defun %env-seconds (name)
+  "→ (values seconds found-p) from env NAME: a number of seconds, or
+0 / none / off for no limit. Unset or empty → (values nil nil)."
+  (let ((v (%env name)))
+    (cond
+      ((null v) (values nil nil))
+      ((member (string-trim " " v) '("none" "off" "nil") :test #'string-equal)
+       (values nil t))
+      (t
+       (let ((n (ignore-errors
+                 (with-standard-io-syntax
+                   (let ((*read-eval* nil))
+                     (read-from-string v))))))
+         (unless (and (realp n) (not (minusp n)))
+           (error 'llm-error
+                  :message (format nil "~a must be seconds (a number, or none), got ~s"
+                                   name v)))
+         (values (%timeout-seconds-value n name) t))))))
+
+(defun %resolve-seconds (value supplied-p env default what)
+  "An initarg (NIL = no limit) wins; else env ENV; else DEFAULT."
+  (if supplied-p
+      (%timeout-seconds-value value what)
+      (multiple-value-bind (v found) (%env-seconds env)
+        (if found v default))))
+
 (defclass openai-compat-backend (llm-backend)
   ((base-url :initarg :base-url :accessor openai-base-url
              :initform +default-openai-base-url+)
@@ -23,6 +69,20 @@ OPENAI-API-KEY reads the plain string.")
    (request-fn :initarg :request-fn :accessor openai-request-fn :initform nil)
    (model-catalog :initarg :model-catalog :accessor openai-model-catalog
                   :initform nil)
+   (request-timeout :initarg :request-timeout :accessor openai-request-timeout
+                    :initform +default-openai-request-timeout+
+                    :documentation "Seconds a non-streaming request may take in all,
+or NIL for no cap. Env OPENAI_TIMEOUT.")
+   (stream-idle-timeout :initarg :stream-idle-timeout
+                        :accessor openai-stream-idle-timeout
+                        :initform +default-openai-stream-idle-timeout+
+                        :documentation "Seconds a streaming response may stay silent, or
+NIL for no limit. Streams have no total cap: one that keeps producing tokens
+runs to the end. Env OPENAI_STREAM_IDLE_TIMEOUT.")
+   (connect-timeout :initarg :connect-timeout :accessor openai-connect-timeout
+                    :initform +default-openai-connect-timeout+
+                    :documentation "Seconds to connect (TCP + TLS), or NIL.
+Env OPENAI_CONNECT_TIMEOUT.")
    (prompt-cache-key :initarg :prompt-cache-key :accessor openai-prompt-cache-key
                      :initform nil
                      :documentation "Default prompt_cache_key (string or NIL): the
@@ -65,10 +125,30 @@ routing hint for OpenAI's automatic prefix cache, sent on /chat/completions and
 (defun make-openai-compat-backend (&key base-url (api-key nil api-key-p) default-model
                                      embedding-model organization request-fn
                                      prompt-cache-key
+                                     (request-timeout nil request-timeout-p)
+                                     (stream-idle-timeout nil stream-idle-timeout-p)
+                                     (connect-timeout nil connect-timeout-p)
                                      (model-catalog nil model-catalog-supplied-p))
+  "Timeouts are seconds, NIL for no limit. Left out, each reads its env var,
+then the default: :REQUEST-TIMEOUT (OPENAI_TIMEOUT, 600) caps a
+non-streaming request; :STREAM-IDLE-TIMEOUT (OPENAI_STREAM_IDLE_TIMEOUT, 300)
+fails a stream silent that long, with no total cap; :CONNECT-TIMEOUT
+(OPENAI_CONNECT_TIMEOUT, 30). A custom :REQUEST-FN owns its own timeouts."
   (check-type prompt-cache-key (or null string))
   (make-instance 'openai-compat-backend
                  :prompt-cache-key prompt-cache-key
+                 :request-timeout (%resolve-seconds
+                                   request-timeout request-timeout-p "OPENAI_TIMEOUT"
+                                   +default-openai-request-timeout+ :request-timeout)
+                 :stream-idle-timeout (%resolve-seconds
+                                       stream-idle-timeout stream-idle-timeout-p
+                                       "OPENAI_STREAM_IDLE_TIMEOUT"
+                                       +default-openai-stream-idle-timeout+
+                                       :stream-idle-timeout)
+                 :connect-timeout (%resolve-seconds
+                                   connect-timeout connect-timeout-p
+                                   "OPENAI_CONNECT_TIMEOUT"
+                                   +default-openai-connect-timeout+ :connect-timeout)
                  :base-url (or base-url (%env "OPENAI_BASE_URL")
                                +default-openai-base-url+)
                  :api-key (%resolve-api-key api-key api-key-p "OPENAI_API_KEY" "LM_API_TOKEN")
@@ -220,13 +300,25 @@ backend default. NIL or :omit in extra means none."
        (babel:octets-to-string b :encoding :utf-8))
       (t ""))))
 
-(defun %http-request (method url &key headers content want-stream)
+(defun %request-timeout-spec (backend want-stream)
+  "http-protocol timeout plist for one request.
+   Streaming: :CONNECT + :READ (idle), no :TOTAL, so a stream that keeps
+   producing tokens is never cut off. Non-streaming: :CONNECT + :TOTAL
+   (the server is silent until the whole answer is ready)."
+  (let ((connect (openai-connect-timeout backend)))
+    (if want-stream
+        (list :connect connect :read (openai-stream-idle-timeout backend))
+        (list :connect connect :total (openai-request-timeout backend)))))
+
+(defun %http-request (method url &key headers content want-stream
+                                   (timeout (list :connect +default-openai-connect-timeout+
+                                                  :total +default-openai-request-timeout+)))
   (unless http-protocol:*http-backend*
     (error 'llm-error
            :message "*http-backend* is nil — bind an http-protocol backend"))
   (let ((res (apply #'http:request method url
                     :headers headers
-                    :timeout 180
+                    :timeout timeout
                     :want-stream (and want-stream t)
                     (and content (list :content content)))))
     (values (http-protocol:response-status res)
@@ -235,7 +327,7 @@ backend default. NIL or :omit in extra means none."
                 (%body-string res)))))
 
 (defun %request (backend method path &key object want-stream accept)
-  (let* ((fn (or (openai-request-fn backend) #'%http-request))
+  (let* ((custom (openai-request-fn backend))
          (url (%join (openai-base-url backend) path))
          (content (and object (stack-json:encode object)))
          (headers (%headers backend
@@ -244,8 +336,14 @@ backend default. NIL or :omit in extra means none."
                                             "text/event-stream"
                                             "application/json")))))
     (multiple-value-bind (status body)
-        (funcall fn method url :headers headers :content content
-                 :want-stream want-stream)
+        (if custom
+            ;; a custom transport keeps its call shape and owns its timeouts
+            (funcall custom method url :headers headers :content content
+                     :want-stream want-stream)
+            (%http-request method url :headers headers :content content
+                                      :want-stream want-stream
+                                      :timeout (%request-timeout-spec
+                                                backend want-stream)))
       (values status body))))
 
 (defun %error-message (obj fallback)
