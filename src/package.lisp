@@ -24,6 +24,10 @@
            #:+default-openai-base-url+
            #:+default-openai-embedding-model+
            #:+default-local-model-flags+
-           #:encode-image-part))
+           #:encode-image-part
+           ;; 0.7.0 (src/errors.lisp)
+           #:+openai-context-overflow-markers+
+           #:openai-context-overflow-text-p
+           #:openai-model-context-window))
 
 (in-package #:llm-protocol-openai)

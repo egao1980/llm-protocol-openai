@@ -1,9 +1,9 @@
 (defsystem "llm-protocol-openai"
-  :version "0.7.0"
+  :version "0.8.0"
   :description "OpenAI chat/completions + Responses + embeddings backend for llm-protocol"
   :author "egao1980"
   :license "MIT"
-  :depends-on ((:version "llm-protocol" "0.6.0") (:version "http-protocol" "0.4.0") "json-protocol" "json-backend-jzon"
+  :depends-on ((:version "llm-protocol" "0.7.0") (:version "http-protocol" "0.4.0") "json-protocol" "json-backend-jzon"
                "sse-protocol" "babel")
   :properties
   (:cl-repo
@@ -15,6 +15,7 @@
   :components ((:file "package")
                (:file "catalog")
                (:file "backend")
+               (:file "errors")
                (:file "stream"))
   :in-order-to ((test-op (test-op "llm-protocol-openai/tests"))))
 
@@ -28,7 +29,8 @@
                (:file "backend-test")
                (:file "keys-test")
                (:file "stream-incomplete-test")
-               (:file "timeout-test"))
+               (:file "timeout-test")
+               (:file "errors-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))
