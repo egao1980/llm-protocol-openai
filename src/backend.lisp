@@ -87,7 +87,12 @@ Env OPENAI_CONNECT_TIMEOUT.")
                      :initform nil
                      :documentation "Default prompt_cache_key (string or NIL): the
 routing hint for OpenAI's automatic prefix cache, sent on /chat/completions and
-/responses. Per call: settings extra :prompt-cache-key (NIL or :omit drops it).")))
+/responses. Per call: settings extra :prompt-cache-key (NIL or :omit drops it).")
+   (model-windows :initform :unfetched
+                  :documentation "GET /models as an EQUAL table, model id → context
+window or NIL (src/errors.lisp). Filled by the first OPENAI-MODEL-CONTEXT-WINDOW
+(empty when that fetch failed) and refreshed by each successful LIST-MODELS;
+:UNFETCHED before.")))
 
 (defun %resolve-api-key (value supplied-p &rest env-names)
   "API key from a constructor argument (llm-protocol#10).
@@ -324,9 +329,15 @@ backend default. NIL or :omit in extra means none."
     (values (http-protocol:response-status res)
             (if want-stream
                 (http-protocol:response-body res)
-                (%body-string res)))))
+                (%body-string res))
+            ;; H3f: Retry-After as a third value (src/errors.lisp)
+            (http-protocol:response-header res "retry-after"))))
 
 (defun %request (backend method path &key object want-stream accept)
+  "One request to BACKEND's base URL + PATH → (values status body retry-after):
+the custom :REQUEST-FN's values (two mean no Retry-After), else
+%HTTP-REQUEST's. Transport conditions come out as LLM-TRANSPORT-ERRORs
+(%CALL-WITH-OPENAI-TRANSPORT-ERRORS, src/errors.lisp); statuses are values."
   (let* ((custom (openai-request-fn backend))
          (url (%join (openai-base-url backend) path))
          (content (and object (stack-json:encode object)))
@@ -335,16 +346,19 @@ backend default. NIL or :omit in extra means none."
                                         (if want-stream
                                             "text/event-stream"
                                             "application/json")))))
-    (multiple-value-bind (status body)
-        (if custom
-            ;; a custom transport keeps its call shape and owns its timeouts
-            (funcall custom method url :headers headers :content content
-                     :want-stream want-stream)
-            (%http-request method url :headers headers :content content
-                                      :want-stream want-stream
-                                      :timeout (%request-timeout-spec
-                                                backend want-stream)))
-      (values status body))))
+    (%call-with-openai-transport-errors
+     backend
+     (lambda ()
+       (multiple-value-bind (status body retry-after)
+           (if custom
+               ;; a custom transport keeps its call shape and owns its timeouts
+               (funcall custom method url :headers headers :content content
+                                          :want-stream want-stream)
+               (%http-request method url :headers headers :content content
+                                         :want-stream want-stream
+                                         :timeout (%request-timeout-spec
+                                                   backend want-stream)))
+         (values status body retry-after))))))
 
 (defun %error-message (obj fallback)
   (cond
@@ -355,23 +369,38 @@ backend default. NIL or :omit in extra means none."
        (if (stringp err) err (princ-to-string err))))
     (t fallback)))
 
-(defun %decode (status body)
+(defun %error-field (obj key)
+  "KEY (\"code\", \"type\") of the \"error\" object in OBJ, a decoded error
+body, or NIL."
+  (let ((err (and (hash-table-p obj) (gethash "error" obj))))
+    (and (hash-table-p err) (gethash key err))))
+
+(defun %decode (backend status body &key retry-after model)
+  "BODY as decoded JSON for a 2xx STATUS. Any other STATUS signals its typed
+LLM-HTTP-ERROR (%OPENAI-HTTP-ERROR, src/errors.lisp: the server's
+error.message, error.code and error.type, RETRY-AFTER, the request's MODEL)
+with 0.6's RETRY and USE-VALUE restarts; USE-VALUE's value is returned in
+place of the decoded body."
   (let ((obj (ignore-errors (stack-json:decode body))))
     (cond
       ((<= 200 status 299) (or obj (error 'llm-error :message "empty JSON body")))
       (t
-       (restart-case
-           (error 'llm-http-error
-                  :status status
-                  :body body
-                  :retryable-p (http-status-retryable-p status)
-                  :message (%error-message obj (format nil "HTTP ~a" status)))
-         (retry ()
-           :report "Retry the HTTP request"
-           (llm-protocol::%invoke-retry))
-         (use-value (value)
-           :report "Use a supplied decoded object"
-           value))))))
+       (%signal-openai-http-error
+        (%openai-http-error backend status
+                            :body body
+                            :message (%error-message obj nil)
+                            :code (%error-field obj "code")
+                            :type (%error-field obj "type")
+                            :retry-after retry-after
+                            :model model))))))
+
+(defun %call-endpoint (backend method path &key object model)
+  "One non-streaming call: %REQUEST, then %DECODE with its Retry-After and
+MODEL (the request's model, or NIL) → the decoded JSON object, or USE-VALUE's
+value."
+  (multiple-value-bind (status text retry-after)
+      (%request backend method path :object object)
+    (%decode backend status text :retry-after retry-after :model model)))
 
 (defun %str (x)
   (cond
@@ -764,9 +793,9 @@ writes. TOTAL-TOKENS is passed through."
   (multiple-value-bind (model body)
       (%chat-completion-body backend turns :model model :settings settings
                              :tools tools :tool-choice tool-choice)
-    (multiple-value-bind (status text)
-        (%request backend :post "/chat/completions" :object body)
-      (%parse-response (%decode status text) model backend))))
+    (%parse-response
+     (%call-endpoint backend :post "/chat/completions" :object body :model model)
+     model backend)))
 
 (defmethod respond ((backend openai-compat-backend) items &key model settings
                     tools tool-choice output)
@@ -774,20 +803,33 @@ writes. TOTAL-TOKENS is passed through."
   (multiple-value-bind (model body)
       (%responses-body backend items :model model :settings settings
                        :tools tools :tool-choice tool-choice)
-    (multiple-value-bind (status text)
-        (%request backend :post "/responses" :object body)
-      (%parse-responses (%decode status text) model))))
+    (%parse-responses
+     (%call-endpoint backend :post "/responses" :object body :model model)
+     model)))
+
+(defun %fetch-model-entries (backend)
+  "GET <base>/models → its \"data\" entries as a list (JSON objects, or
+whatever else the server put there). Signals what %CALL-ENDPOINT signals."
+  (let* ((obj (%call-endpoint backend :get "/models"))
+         (data (and (hash-table-p obj) (gethash "data" obj))))
+    (typecase data
+      (string '())
+      (list data)
+      (vector (coerce data 'list))
+      (t '()))))
 
 (defmethod list-models ((backend openai-compat-backend) &key)
-  (multiple-value-bind (status text)
-      (%request backend :get "/models")
-    (let* ((obj (%decode status text))
-           (data (or (and (hash-table-p obj) (gethash "data" obj)) #())))
-      (mapcar (lambda (m)
-                (make-llm-model-info
-                 :id (if (hash-table-p m) (gethash "id" m) (princ-to-string m))
-                 :owned-by (and (hash-table-p m) (gethash "owned_by" m))))
-              (llm-protocol::%as-list data)))))
+  "A fresh GET <base>/models. Each LLM-MODEL-INFO carries the entry's context
+window when the server reports one (src/errors.lisp's key order), and the
+listing refreshes the windows OPENAI-MODEL-CONTEXT-WINDOW caches."
+  (let ((entries (%fetch-model-entries backend)))
+    (setf (slot-value backend 'model-windows) (%model-windows-table entries))
+    (mapcar (lambda (m)
+              (make-llm-model-info
+               :id (if (hash-table-p m) (gethash "id" m) (princ-to-string m))
+               :owned-by (and (hash-table-p m) (gethash "owned_by" m))
+               :context-window (%entry-context-window m)))
+            entries)))
 
 (defun %float-vec (seq)
   (map 'vector (lambda (x) (float x 1f0)) (llm-protocol::%as-list seq)))
@@ -826,6 +868,6 @@ writes. TOTAL-TOKENS is passed through."
                                 (map 'vector #'identity texts))
                     "dimensions" (or dimensions :omit)
                     "encoding_format" "float")))
-    (multiple-value-bind (status text)
-        (%request backend :post "/embeddings" :object body)
-      (%parse-embeddings (%decode status text) model))))
+    (%parse-embeddings
+     (%call-endpoint backend :post "/embeddings" :object body :model model)
+     model)))
