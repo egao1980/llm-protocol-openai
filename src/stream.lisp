@@ -67,8 +67,12 @@ signal LLM-INCOMPLETE-RESPONSE with it; USE-PARTIAL-RESPONSE returns it."
       (and (hash-table-p obj) (gethash "type" obj))))
 
 (defun %emit-part (on-part part)
+  "Call the caller's ON-PART with PART, when both are given. A condition
+ON-PART signals stays the caller's: it is not this backend's transport, so it
+is never translated (*%OPENAI-TRANSPORT-SCOPE*, src/errors.lisp)."
   (when (and on-part part)
-    (funcall on-part part)))
+    (let ((*%openai-transport-scope* nil))
+      (funcall on-part part))))
 
 (defun %chat-chunk-p (obj)
   (and (hash-table-p obj) (gethash "choices" obj)))
@@ -101,7 +105,25 @@ signal LLM-INCOMPLETE-RESPONSE with it; USE-PARTIAL-RESPONSE returns it."
                :arguments (or (getf acc :arguments) ""))))
           (sort (loop for k being the hash-keys of table collect k) #'<)))
 
-(defun %signal-stream-error (obj)
+(defun %stream-error-event-p (event obj)
+  "T when the decoded SSE object OBJ of EVENT reports an error instead of
+carrying a chunk: no \"choices\", and either an \"error\" that is not JSON null
+or the SSE event type `error`."
+  (and (hash-table-p obj)
+       (not (%chat-chunk-p obj))
+       (or (let ((err (gethash "error" obj)))
+             (and err (not (eq err :null))))
+           (let ((type (and event (sse-protocol:sse-event-type event))))
+             (and (stringp type) (string-equal type "error"))))
+       t))
+
+(defun %signal-stream-error (backend obj &key body model)
+  "Signal the stream error event OBJ (a chat {\"error\": …}, a Responses `error`
+or `response.failed`) through %OPENAI-HTTP-ERROR, with 0.6's RETRY and
+USE-VALUE restarts (rules: src/errors.lisp). The status is the event's
+\"status\", else the error's \"code\", when it is an HTTP status (an integer
+from 100 to 599; a server's own error number is not); with none the mapper
+uses 500. BODY is the event's raw data, MODEL the request's model."
   (let* ((err (and (hash-table-p obj)
                    (or (gethash "error" obj)
                        (let ((resp (gethash "response" obj)))
@@ -111,26 +133,28 @@ signal LLM-INCOMPLETE-RESPONSE with it; USE-PARTIAL-RESPONSE returns it."
                 ((stringp err) err)
                 ((and (hash-table-p obj) (gethash "message" obj))
                  (gethash "message" obj))
-                (t "stream error"))))
-    (restart-case
-        (error 'llm-http-error
-               :status (and (hash-table-p obj) (gethash "status" obj))
-               :retryable-p nil
-               :message msg)
-      (retry ()
-        :report "Retry the HTTP request"
-        (llm-protocol::%invoke-retry))
-      (use-value (value)
-        :report "Use a supplied decoded object"
-        value))))
+                (t "stream error")))
+         (code (if (hash-table-p err)
+                   (gethash "code" err)
+                   (and (hash-table-p obj) (gethash "code" obj))))
+         (type (and (hash-table-p err) (gethash "type" err)))
+         (status (find-if (lambda (s) (typep s '(integer 100 599)))
+                          (list (and (hash-table-p obj) (gethash "status" obj)) code))))
+    (%signal-openai-http-error
+     (%openai-http-error backend status
+                         :body body :message msg :code code :type type
+                         :model model))))
 
-(defun %stream-body (backend method path object)
-  (multiple-value-bind (status body)
+(defun %stream-body (backend method path object &key model)
+  "The SSE body of a streaming request. A non-2xx status signals its typed
+LLM-HTTP-ERROR through %DECODE, with the Retry-After and MODEL."
+  (multiple-value-bind (status body retry-after)
       (%request backend method path :object object
                 :want-stream t
                 :accept "text/event-stream")
     (unless (<= 200 status 299)
-      (%decode status (%coerce-body-string body)))
+      (%decode backend status (%coerce-body-string body)
+               :retry-after retry-after :model model))
     body))
 
 (defun %apply-chat-chunk (obj text thinking tools on-part)
@@ -214,12 +238,16 @@ some chunk, or `data: [DONE]`:
        (if (%sse-done-p event)
            (setf done t)
            (let ((obj (%sse-json event)))
-             (when (hash-table-p obj)
-               (multiple-value-bind (chunk-finish chunk-usage chunk-model)
-                   (%apply-chat-chunk obj text thinking tools on-part)
-                 (when chunk-finish (setf finish chunk-finish))
-                 (when chunk-usage (setf usage chunk-usage))
-                 (when chunk-model (setf seen-model chunk-model))))))))
+             (cond ((%stream-error-event-p event obj)
+                    (%signal-stream-error backend obj
+                                          :body (sse-protocol:sse-event-data event)
+                                          :model requested-model))
+                   ((hash-table-p obj)
+                    (multiple-value-bind (chunk-finish chunk-usage chunk-model)
+                        (%apply-chat-chunk obj text thinking tools on-part)
+                      (when chunk-finish (setf finish chunk-finish))
+                      (when chunk-usage (setf usage chunk-usage))
+                      (when chunk-model (setf seen-model chunk-model)))))))))
     (let* ((complete (or finish done))
            (response (%assemble-chat-response
                       text thinking tools finish usage seen-model
@@ -259,7 +287,7 @@ some chunk, or `data: [DONE]`:
                      :arguments (llm-tool-call-part-arguments p)))
                   calls)))
 
-(defun %consume-responses-sse (body on-part requested-model)
+(defun %consume-responses-sse (body on-part requested-model &optional backend)
   (let ((text (make-string-output-stream))
         (thinking (make-string-output-stream))
         (tools (make-hash-table :test 'eql))
@@ -278,6 +306,10 @@ some chunk, or `data: [DONE]`:
                     (%sse-json event))))
          (when (hash-table-p obj)
            (cond
+             ((%stream-error-event-p event obj)
+              (%signal-stream-error backend obj
+                                    :body (sse-protocol:sse-event-data event)
+                                    :model requested-model))
              ((%chat-chunk-p obj)
               (setf chat-style t)
               (multiple-value-bind (chunk-finish chunk-usage chunk-model)
@@ -346,7 +378,9 @@ some chunk, or `data: [DONE]`:
                              usage (or (%usage (gethash "usage" resp)) usage)))))
                   ((or (string-equal type "response.failed")
                        (string-equal type "error"))
-                   (%signal-stream-error obj))))))))))
+                   (%signal-stream-error backend obj
+                                         :body (sse-protocol:sse-event-data event)
+                                         :model requested-model))))))))))
     (cond
       ((hash-table-p completed)
        (let ((r (%parse-responses completed (or seen-model requested-model))))
@@ -393,8 +427,12 @@ some chunk, or `data: [DONE]`:
   (multiple-value-bind (model body)
       (%chat-completion-body backend turns :model model :settings settings
                              :tools tools :tool-choice tool-choice :stream t)
-    (%consume-chat-sse (%stream-body backend :post "/chat/completions" body)
-                       on-part model backend)))
+    (%call-with-openai-transport-errors
+     backend
+     (lambda ()
+       (%consume-chat-sse (%stream-body backend :post "/chat/completions" body
+                                        :model model)
+                          on-part model backend)))))
 
 (defmethod stream-respond ((backend openai-compat-backend) items &key model
                            settings tools tool-choice on-part output)
@@ -402,5 +440,9 @@ some chunk, or `data: [DONE]`:
   (multiple-value-bind (model body)
       (%responses-body backend items :model model :settings settings
                        :tools tools :tool-choice tool-choice :stream t)
-    (%consume-responses-sse (%stream-body backend :post "/responses" body)
-                            on-part model)))
+    (%call-with-openai-transport-errors
+     backend
+     (lambda ()
+       (%consume-responses-sse (%stream-body backend :post "/responses" body
+                                             :model model)
+                               on-part model backend)))))

@@ -3,7 +3,7 @@
   :description "OpenAI chat/completions + Responses + embeddings backend for llm-protocol"
   :author "egao1980"
   :license "MIT"
-  :depends-on ((:version "llm-protocol" "0.7.0") (:version "http-protocol" "0.4.0") "json-protocol" "json-backend-jzon"
+  :depends-on ((:version "llm-protocol" "0.7.0") (:version "http-protocol" "0.4.3") "json-protocol" "json-backend-jzon"
                "sse-protocol" "babel")
   :properties
   (:cl-repo

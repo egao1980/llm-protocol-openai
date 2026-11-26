@@ -25,7 +25,7 @@
            #:+default-openai-embedding-model+
            #:+default-local-model-flags+
            #:encode-image-part
-           ;; 0.7.0 (src/errors.lisp)
+           ;; 0.8.0 (src/errors.lisp)
            #:+openai-context-overflow-markers+
            #:openai-context-overflow-text-p
            #:openai-model-context-window))
